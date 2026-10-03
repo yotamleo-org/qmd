@@ -107,7 +107,7 @@ import { formatMetadataKeySummaries, formatMetadataOverview } from "../metadata-
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, isLlamaPoisoned, killProcessNow, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -298,6 +298,20 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
   await new Promise<void>((resolve) => {
     stream.write("", () => resolve());
   });
+}
+
+/**
+ * A rerank that timed out leaves a native call spinning forever, so a normal
+ * teardown (dispose, beforeExit) would hang too. The fallback results are
+ * already printed: flush and kill the process (exit() would block on the stuck
+ * native thread under Node).
+ */
+async function exitIfRerankHung(): Promise<void> {
+  if (!isLlamaPoisoned()) return;
+  process.stderr.write("QMD Warning: rerank timed out; showing unreranked (RRF) results. Raise QMD_RERANK_TIMEOUT_MS or check the GPU.\n");
+  await flushWritable(process.stdout);
+  await flushWritable(process.stderr);
+  killProcessNow();
 }
 
 /**
@@ -3288,6 +3302,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
     if (results.length === 0) {
       printEmptySearchResults(opts.format);
+      await exitIfRerankHung();
       return;
     }
 
@@ -3310,6 +3325,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       metadata: r.metadata,
       explain: r.explain,
     })), displayQuery, { ...opts, limit: results.length });
+    await exitIfRerankHung();
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 

@@ -62,6 +62,8 @@ import {
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  resolveRerankTimeoutMs,
+  RerankTimeoutError,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -5316,6 +5318,14 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
+const DEFAULT_RERANK_MAX_DOC_CHARS = 6000;
+
+/** Max characters of one chunk sent to the reranker. Override with QMD_RERANK_MAX_DOC_CHARS. */
+export function resolveRerankMaxDocChars(): number {
+  const raw = Number(process.env.QMD_RERANK_MAX_DOC_CHARS);
+  return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_RERANK_MAX_DOC_CHARS;
+}
+
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
@@ -5346,7 +5356,27 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
+    const maxChars = resolveRerankMaxDocChars();
+    const sentDocs = uncachedDocs.map(d => d.text.length > maxChars ? { ...d, text: d.text.slice(0, maxChars) } : d);
+    // Cold model/context load can legitimately take a while: keep it out of the budget.
+    await llm.prepareRerank?.();
+    const timeoutMs = resolveRerankTimeoutMs();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let rerankResult;
+    try {
+      rerankResult = await Promise.race([
+        llm.rerank(rerankQuery, sentDocs, { model: cacheModel }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new RerankTimeoutError(timeoutMs)), timeoutMs);
+        }),
+      ]);
+    } catch (err) {
+      // The hung native call cannot be cancelled: refuse all further native work.
+      if (err instanceof RerankTimeoutError) llm.poison(err.message);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
@@ -6212,6 +6242,8 @@ export interface HybridQueryResult {
   docid: string;            // content hash prefix (6 chars)
   metadata: DocumentMetadata; // indexed qmd.metadata for the document
   explain?: HybridQueryExplain;
+  /** Set when the reranker timed out: scores are RRF-only (unreranked). */
+  rerankTimedOut?: true;
 }
 
 /**
@@ -6492,7 +6524,16 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  let rerankTimedOut = false;
+  let reranked: { file: string; score: number }[];
+  try {
+    reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  } catch (err) {
+    if (!(err instanceof RerankTimeoutError)) throw err;
+    // Fall back to the unreranked hybrid (RRF) order.
+    rerankTimedOut = true;
+    reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
+  }
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -6508,6 +6549,7 @@ export async function hybridQuery(
     if (rrfRank <= 3) rrfWeight = 0.75;
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
+    if (rerankTimedOut) rrfWeight = 1.0;
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
@@ -6543,6 +6585,7 @@ export async function hybridQuery(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      ...(rerankTimedOut ? { rerankTimedOut: true as const } : {}),
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
@@ -6887,7 +6930,16 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  let rerankTimedOut = false;
+  let reranked: { file: string; score: number }[];
+  try {
+    reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  } catch (err) {
+    if (!(err instanceof RerankTimeoutError)) throw err;
+    // Fall back to the unreranked hybrid (RRF) order.
+    rerankTimedOut = true;
+    reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
+  }
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -6902,6 +6954,7 @@ export async function structuredSearch(
     if (rrfRank <= 3) rrfWeight = 0.75;
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
+    if (rerankTimedOut) rrfWeight = 1.0;
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
@@ -6937,6 +6990,7 @@ export async function structuredSearch(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      ...(rerankTimedOut ? { rerankTimedOut: true as const } : {}),
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
