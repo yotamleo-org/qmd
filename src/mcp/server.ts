@@ -66,6 +66,7 @@ type SearchResultItem = {
   metadata?: DocumentMetadata;  // Indexed qmd.metadata (present when non-empty)
   line: number;   // Absolute line in source markdown
   snippet: string;
+  rerankTimedOut?: true;  // Reranker timed out: score is RRF-only (unreranked)
 };
 
 /**
@@ -141,6 +142,9 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];
   for (const r of results) {
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
+  }
+  if (results.some(r => r.rerankTimedOut)) {
+    lines.push('\nNote: the reranker timed out; results are unreranked (RRF order) and the server is restarting.');
   }
   return lines.join('\n');
 }
@@ -502,6 +506,7 @@ Intent-aware lex (C++ performance, not sports):
           score: Math.round(r.score * 100) / 100,
           context: r.context,
           ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
+          ...(r.rerankTimedOut ? { rerankTimedOut: true as const } : {}),
           line,
           snippet: addLineNumbers(snippet, line),
         };
@@ -1280,6 +1285,7 @@ export async function startMcpHttpServer(
             score: Math.round(r.score * 100) / 100,
             context: r.context,
             ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
+            ...(r.rerankTimedOut ? { rerankTimedOut: true as const } : {}),
             line,
             snippet: addLineNumbers(snippet, line),
           };

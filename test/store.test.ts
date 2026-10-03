@@ -77,6 +77,7 @@ import {
   type SearchResult,
   type RankedResult,
   type RankedListMeta,
+  resolveRerankMaxDocChars,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
 import { LEGACY_VEC_TABLE, VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE, VEC_TABLE, deletePartitionRows, resolveCollectionId, vecInteger } from "../src/vec-layout.js";
@@ -1290,10 +1291,10 @@ describe("Caching", () => {
       expect(first[0]!.score).toBe(0.11);
       expect(mockA.spy).toHaveBeenCalledTimes(1);
 
-      const keyA = getCacheKey("rerank", { query, model: modelA, chunk });
-      const keyB = getCacheKey("rerank", { query, model: modelB, chunk });
-      const keyDefault = getCacheKey("rerank", { query, model: DEFAULT_RERANK_MODEL, chunk });
-      const keyNoModel = getCacheKey("rerank", { query, chunk });
+      const keyA = getCacheKey("rerank", { query, model: modelA, chunk, maxChars: resolveRerankMaxDocChars() });
+      const keyB = getCacheKey("rerank", { query, model: modelB, chunk, maxChars: resolveRerankMaxDocChars() });
+      const keyDefault = getCacheKey("rerank", { query, model: DEFAULT_RERANK_MODEL, chunk, maxChars: resolveRerankMaxDocChars() });
+      const keyNoModel = getCacheKey("rerank", { query, chunk, maxChars: resolveRerankMaxDocChars() });
 
       expect(store.getCachedResult(keyA)).toBe("0.11");
       expect(store.getCachedResult(keyNoModel)).toBeNull();
