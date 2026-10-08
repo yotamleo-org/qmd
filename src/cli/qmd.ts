@@ -5179,7 +5179,11 @@ if (isMain) {
         process.on("exit", unlinkOwnPidfile);
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          // Bearer token from a 0600 file (generated on first start). Clients
+          // send `Authorization: Bearer <token>`. QMD_HTTP_AUTH=off disables it.
+          const { loadOrCreateToken } = await import("../mcp/auth.js");
+          const authToken = process.env.QMD_HTTP_AUTH === "off" ? undefined : loadOrCreateToken();
+          await startMcpHttpServer(port, { dbPath: getDbPath(), host, ...(authToken ? { authToken } : {}) });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
