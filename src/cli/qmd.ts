@@ -3,6 +3,7 @@ import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
 import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
+import { swapLockDir, swapLockHolder } from "./swap-lock.js";
 import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
@@ -4867,6 +4868,17 @@ if (isMain) {
         // fallback (resolved in startMcpHttpServer). Use "0.0.0.0" to accept
         // off-host connections, e.g. a container liveness probe.
         const host = cli.values.host ? String(cli.values.host) : undefined;
+
+        // An embed-model swap holds this lock; a server started inside it
+        // embeds queries with the old model against the new vectors.
+        const swapHolder = swapLockHolder();
+        if (swapHolder !== null) {
+          console.error(
+            `Refusing to start: an embed-model swap holds ${swapLockDir()}` +
+            `${swapHolder > 0 ? ` (pid ${swapHolder})` : ""}. Wait for it to finish, then start again.`,
+          );
+          process.exit(1);
+        }
 
         if (cli.values.daemon) {
           // Guard: check if already running (identity-checked — recycled PIDs are stale)
