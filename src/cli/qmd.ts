@@ -157,18 +157,24 @@ function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    let runtime: { activeModels: ReturnType<typeof ensureModelsConfiguredForCli>; config: CollectionConfig } | null = null;
     try {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      // Untrusted project-local custom model URIs (and the endpoint they
-      // would send documents to) must not be used; status still displays the
-      // YAML values via resolveModelsForCli (#889).
-      const llm = createLlm(llmConfigForRuntime(activeModels, config));
-      setDefaultLlamaCpp(llm);
-      store.llm = llm;
+      runtime = { activeModels, config };
     } catch {
       // Config may not exist yet — that's fine, DB works without it
+    }
+    if (runtime) {
+      // Untrusted project-local custom model URIs (and the endpoint they
+      // would send documents to) must not be used; status still displays the
+      // YAML values via resolveModelsForCli (#889). Outside the try above: an
+      // `openai:` model without a base URL must fail loudly, never fall back to
+      // a local model that would label its vectors as the remote one.
+      const llm = createLlm(llmConfigForRuntime(runtime.activeModels, runtime.config));
+      setDefaultLlamaCpp(llm);
+      store.llm = llm;
     }
   }
   return store;

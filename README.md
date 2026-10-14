@@ -817,7 +817,12 @@ reach outside the project, and QMD will not use them unattended:
 - `update` commands — somebody else's shell script, run by `qmd update`
 - `collections.*.path` pointing **outside** the project directory
 - `models.embed` / `models.rerank` / `models.generate` other than the built-in
-  defaults (any `hf:` repo or local GGUF path)
+  defaults (any `hf:` repo or local GGUF path, or any `openai:` model) and the
+  `openai_base_url` they send documents to
+
+The same rule applies to the SDK and `qmd mcp` (stdio and `--http`): an
+untrusted `.qmd/index.yml` there falls back to the built-in/env models and no
+remote endpoint, with no prompt.
 
 In-project collection paths (for example `./docs`) still index. On a terminal
 `qmd update` (and `qmd embed` / `qmd pull` / `qmd query`) lists the gated

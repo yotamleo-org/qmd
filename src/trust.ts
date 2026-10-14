@@ -22,7 +22,7 @@
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
-import { getConfigDir } from "./collections.js";
+import { getConfigDir, type CollectionConfig } from "./collections.js";
 import { qmdHomedir } from "./paths.js";
 
 /** A collection's pre-update hook, as it will be executed. */
@@ -271,6 +271,39 @@ export type LocalConfigGateDecision = HookGateDecision;
 function isTruthyEnv(value: string | undefined): boolean {
   if (!value) return false;
   return !["0", "false", "off", "no", "none"].includes(value.trim().toLowerCase());
+}
+
+/**
+ * Whether a config's remote-capable fields (`models.*`, `openai_*`) may be used
+ * by a non-interactive caller such as `createStore` (SDK, MCP). Mirrors the CLI
+ * gate: a project-local config is trusted when the process opted in, when it
+ * gates nothing, or when its current digest was approved with `qmd trust`.
+ * Global configs are always usable. Never prompts.
+ */
+export function localConfigModelsUsable(
+  configPath: string,
+  config: CollectionConfig,
+  builtins: BuiltinModels,
+): boolean {
+  if (!isLocalConfigPath(configPath)) return true;
+  if (isLocalConfigTrustOptedIn()) return true;
+  const snapshot: SensitiveSnapshot = {
+    hooks: Object.entries(config.collections ?? {})
+      .filter(([, col]) => !!col.update)
+      .map(([name, col]) => ({ collection: name, command: col.update! })),
+    paths: Object.entries(config.collections ?? {}).map(([name, col]) => ({
+      collection: name,
+      path: col.path,
+    })),
+    models: {
+      embed: config.models?.embed,
+      rerank: config.models?.rerank,
+      generate: config.models?.generate,
+      openai_base_url: config.models?.openai_base_url,
+    },
+  };
+  if (!hasGatedItems(gatedItems(configPath, snapshot, builtins))) return true;
+  return isTrusted(configPath, sensitiveDigest(snapshot, configPath, builtins));
 }
 
 /** True when the process has opted in to trusting project-local config unattended. */
