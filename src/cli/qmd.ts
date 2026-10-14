@@ -71,6 +71,7 @@ import {
   type ExpandedQuery,
   type HybridQueryExplain,
   DEFAULT_EMBED_MODEL,
+  estimateCorpusEmbedTokens,
   DEFAULT_EMBED_MAX_BATCH_BYTES,
   DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
   DEFAULT_RERANK_MODEL,
@@ -90,7 +91,7 @@ import {
 import { syncDocumentMetadata, countDocumentsPendingMetadata } from "../metadata-store.js";
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, type MetadataFilter } from "../metadata-filter.js";
-import { disposeDefaultLlamaCpp, isLlamaPoisoned, killProcessNow, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, OpenAiLLM, createLlm, isOpenAiModelUri, resolveOpenAiBaseUrl, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, type LlmConfig } from "../llm.js";
+import { disposeDefaultLlamaCpp, isLlamaPoisoned, killProcessNow, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, OpenAiLLM, CompositeLLM, createLlm, isOpenAiModelUri, resolveOpenAiBaseUrl, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, type LlmConfig } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -300,7 +301,7 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
  */
 async function exitIfRerankHung(): Promise<void> {
   if (!isLlamaPoisoned()) return;
-  process.stderr.write("QMD Warning: rerank timed out; showing unreranked (RRF) results. Raise QMD_RERANK_TIMEOUT_MS (or QMD_RERANK_LOAD_TIMEOUT_MS if the model load hung) or check the GPU.\n");
+  process.stderr.write("QMD Warning: rerank timed out; showing unreranked (RRF) results. Raise QMD_RERANK_TIMEOUT_MS (or QMD_RERANK_LOAD_TIMEOUT_MS if the model load hung) or check the GPU. A remote reranker (models.rerank: openai:<id>) avoids the native hang.\n");
   await flushWritable(process.stdout);
   await flushWritable(process.stderr);
   killProcessNow();
@@ -701,7 +702,7 @@ async function showStatus(): Promise<void> {
     console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
     console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
-    if (isOpenAiModelUri(activeModels.embed)) {
+    if ([activeModels.embed, activeModels.generate, activeModels.rerank].some(isOpenAiModelUri)) {
       console.log(`  Endpoint:    ${resolveOpenAiBaseUrl(loadConfig().models?.openai_base_url) ?? "(not configured)"}`);
     }
   }
@@ -3155,6 +3156,7 @@ function parseCLI() {
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
+      "count-tokens": { type: "boolean" },  // embed dry-run: estimate the tokens of a full reindex, send nothing
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -3696,7 +3698,8 @@ function showHelp(): void {
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
-  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
+  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30; env QMD_EMBED_MAX_DURATION_MS in ms)");
+  console.log("    --count-tokens              - Dry run: estimate the tokens of a full reindex (-f), send nothing");
   console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
   console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
@@ -3999,6 +4002,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
+    if (isOpenAiModelUri(model)) continue; // served remotely: nothing cached
     unique.set(model, [...(unique.get(model) ?? []), role]);
   }
 
@@ -4162,7 +4166,10 @@ function linuxCudaRuntimeDiagnostic(): string | null {
 }
 
 async function runDoctorRemoteChecks(nextSteps: string[]): Promise<void> {
-  const llm = getDefaultLlamaCpp();
+  const backend = getDefaultLlamaCpp();
+  const llm = backend instanceof CompositeLLM
+    ? [backend.embedBackend, backend.generateBackend, backend.rerankBackend].find(b => b instanceof OpenAiLLM)
+    : backend;
   if (!(llm instanceof OpenAiLLM)) {
     doctorCheck("remote endpoint", false, "openai: models configured but the backend is not OpenAiLLM (untrusted project-local config?). Next: `qmd trust`");
     return;
@@ -4194,7 +4201,10 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const llm = getDefaultLlamaCpp();
+    const backend = getDefaultLlamaCpp();
+    const llm = backend instanceof CompositeLLM
+      ? [backend.embedBackend, backend.generateBackend, backend.rerankBackend].find(b => b instanceof LlamaCpp)
+      : backend;
     if (!(llm instanceof LlamaCpp)) throw new Error("default backend is not node-llama-cpp");
     const device = await llm.getDeviceInfo({ allowBuild: false });
     if (process.stdout.isTTY) {
@@ -4292,9 +4302,11 @@ async function showDoctor(): Promise<void> {
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
   // Remote models have no cache and no device; the endpoint is what can fail.
-  if (isOpenAiModelUri(embedModel)) {
+  const activeUris = [activeModels.embed, activeModels.generate, activeModels.rerank];
+  if (activeUris.some(isOpenAiModelUri)) {
     await runDoctorRemoteChecks(nextSteps);
-  } else {
+  }
+  if (!activeUris.every(isOpenAiModelUri)) {
     checkModelCache(activeModels, nextSteps);
     await runDoctorDeviceChecks(nextSteps);
   }
@@ -4774,6 +4786,12 @@ if (isMain) {
         // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
         const embedCollection = embedValidatedCollections[0];
+        if (cli.values["count-tokens"]) {
+          const est = estimateCorpusEmbedTokens(getStore().db, embedCollection);
+          console.log(`Full reindex (qmd embed -f${embedCollection ? ` -c ${embedCollection}` : ""}): ${est.docs} docs, ${est.chunks} chunks, ${est.chars} chars, ~${est.estimatedTokens} tokens (chars/3 estimate). Nothing was sent.`);
+          closeDb();
+          break;
+        }
         await vectorIndex(resolveModelsForRuntime().embed, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
@@ -4795,12 +4813,13 @@ if (isMain) {
         activeModels.generate,
         activeModels.rerank,
       ];
-      if (models.some(isOpenAiModelUri)) {
-        console.log(`Models are served by ${resolveOpenAiBaseUrl(loadConfig().models?.openai_base_url) ?? "the OpenAI-compatible endpoint"}; nothing to download.`);
-        break;
+      const localModels = models.filter(m => !isOpenAiModelUri(m));
+      if (localModels.length < models.length) {
+        console.log(`Some models are served by ${resolveOpenAiBaseUrl(loadConfig().models?.openai_base_url) ?? "the OpenAI-compatible endpoint"}; nothing to download for those.`);
       }
+      if (localModels.length === 0) break;
       console.log(`${c.bold}Pulling models${c.reset}`);
-      const results = await pullModels(models, {
+      const results = await pullModels(localModels, {
         refresh,
         cacheDir: DEFAULT_MODEL_CACHE_DIR,
         cli: Boolean(cli.values.progress),

@@ -10,6 +10,7 @@ import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   OpenAiLLM,
   LlamaCpp,
+  CompositeLLM,
   createLlm,
   isOpenAiModelUri,
   formatQueryForEmbedding,
@@ -182,10 +183,10 @@ describe("openai: model URIs", () => {
     expect(formatQueryForEmbedding("q", "hf:ggml-org/embeddinggemma-300M-GGUF/x.gguf")).toBe("task: search result | query: q");
   });
 
-  test("createLlm picks the backend from the URIs and refuses a mix", () => {
+  test("createLlm picks the backend from the URIs; a mix routes per role", () => {
     expect(createLlm({ embed: "openai:e", generate: "openai:g", rerank: "openai:r", openaiBaseUrl: "http://h/v1" })).toBeInstanceOf(OpenAiLLM);
     expect(createLlm({})).toBeInstanceOf(LlamaCpp);
-    expect(() => createLlm({ embed: "openai:e", openaiBaseUrl: "http://h/v1" })).toThrow(/all be openai: URIs or all local/);
+    expect(createLlm({ embed: "openai:e", openaiBaseUrl: "http://h/v1" })).toBeInstanceOf(CompositeLLM);
   });
 
   test("parseExpansionLines keeps only typed lines that mention the query", () => {
