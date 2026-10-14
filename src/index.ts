@@ -24,6 +24,9 @@ import {
   extractSnippet,
   addLineNumbers,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  DEFAULT_EMBED_MODEL,
+  DEFAULT_RERANK_MODEL,
+  DEFAULT_QUERY_MODEL,
   reindexCollection,
   generateEmbeddings,
   listCollections as storeListCollections,
@@ -66,8 +69,9 @@ import {
   type ChunkStrategy,
 } from "./store.js";
 import {
-  LlamaCpp,
+  createLlm,
 } from "./llm.js";
+import { localConfigModelsUsable } from "./trust.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -412,12 +416,26 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
+  // Create a per-store LLM instance. LlamaCpp lazy-loads models on first use
+  // and auto-unloads after 5 min inactivity to free VRAM; OpenAiLLM holds nothing.
+  // An untrusted project-local config (arrives with a git clone) must not choose
+  // models or an endpoint: the SDK and MCP paths apply the CLI's trust gate here,
+  // non-interactively, and fall back to the built-in/env defaults.
+  const models = config && options.configPath
+    && !localConfigModelsUsable(options.configPath, config, {
+      embed: DEFAULT_EMBED_MODEL,
+      rerank: DEFAULT_RERANK_MODEL,
+      generate: DEFAULT_QUERY_MODEL,
+    })
+    ? undefined
+    : config?.models;
+  const llm = createLlm({
+    embed: models?.embed,
+    generate: models?.generate,
+    rerank: models?.rerank,
+    openaiBaseUrl: models?.openai_base_url,
+    openaiApiKey: models?.openai_api_key,
+    openaiGenerateParams: models?.openai_generate_params,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
