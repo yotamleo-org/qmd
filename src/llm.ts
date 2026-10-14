@@ -2076,11 +2076,30 @@ export type OpenAiLLMConfig = {
    * server (`reasoning_effort`, `think`, …) — so it is config, not code.
    */
   generateParams?: Record<string, unknown>;
+  /** Roles this instance answers; every one must be an `openai:` URI. Defaults to all three. A mixed setup lists only the remote ones. */
+  roles?: readonly LlmRole[];
 };
+
+export type LlmRole = "embed" | "generate" | "rerank";
 
 export function resolveOpenAiBaseUrl(configured?: string): string | undefined {
   const raw = configured || process.env.QMD_OPENAI_BASE_URL;
   return raw ? raw.replace(/\/+$/, "") : undefined;
+}
+
+/** Whether the endpoint is Jina's API, which takes a `task` on embedding requests. */
+export function isJinaEndpoint(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname;
+    return host === "jina.ai" || host.endsWith(".jina.ai");
+  } catch {
+    return false;
+  }
+}
+
+/** The Jina key (JINA_API_KEY, else JINA_API), only ever handed to a jina.ai endpoint. */
+function jinaKeyFor(baseUrl: string): string | undefined {
+  return isJinaEndpoint(baseUrl) ? (process.env.JINA_API_KEY || process.env.JINA_API || undefined) : undefined;
 }
 
 // The smallest per-request `input` limit among common embedding providers
@@ -2117,14 +2136,15 @@ export class OpenAiLLM implements LLM {
       throw new Error("openai: models need an endpoint: set models.openai_base_url in index.yml or QMD_OPENAI_BASE_URL");
     }
     this.baseUrl = baseUrl;
-    this.apiKey = process.env.QMD_OPENAI_API_KEY || config.apiKey;
+    this.apiKey = process.env.QMD_OPENAI_API_KEY || config.apiKey || jinaKeyFor(baseUrl);
     this.generateParams = config.generateParams ?? {};
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
-    for (const uri of [this.embedModelUri, this.generateModelUri, this.rerankModelUri]) {
-      if (!isOpenAiModelUri(uri)) {
-        throw new Error(`OpenAiLLM needs ${OPENAI_MODEL_PREFIX}<model id> URIs, got ${uri}`);
+    const uriByRole: Record<LlmRole, string> = { embed: this.embedModelUri, generate: this.generateModelUri, rerank: this.rerankModelUri };
+    for (const role of config.roles ?? ["embed", "generate", "rerank"] as const) {
+      if (!isOpenAiModelUri(uriByRole[role])) {
+        throw new Error(`OpenAiLLM needs ${OPENAI_MODEL_PREFIX}<model id> URIs, got ${uriByRole[role]}`);
       }
     }
   }
@@ -2194,6 +2214,8 @@ export class OpenAiLLM implements LLM {
         const data = await this.request<{ data: { index: number; embedding: number[] }[] }>("/embeddings", {
           model: this.modelId(this.embedModelUri),
           input,
+          // Jina's retrieval embedders are trained per task; the text itself stays raw.
+          ...(isJinaEndpoint(this.baseUrl) ? { task: options.isQuery ? "retrieval.query" : "retrieval.passage" } : {}),
         });
         for (const item of data.data) {
           results[offset + item.index] = { embedding: item.embedding, model };
@@ -2271,6 +2293,45 @@ export class OpenAiLLM implements LLM {
 }
 
 // =============================================================================
+// Mixed backends
+// =============================================================================
+
+/**
+ * Routes each role to its own backend, so a remote reranker can sit beside
+ * local embeddings (existing vectors stay valid) or the reverse.
+ */
+export class CompositeLLM implements LLM {
+  constructor(
+    readonly embedBackend: LLM,
+    readonly generateBackend: LLM,
+    readonly rerankBackend: LLM,
+  ) {}
+
+  get embedModelName(): string { return this.embedBackend.embedModelName; }
+  get generateModelName(): string { return this.generateBackend.generateModelName; }
+  get rerankModelName(): string { return this.rerankBackend.rerankModelName; }
+
+  embed(text: string, options?: EmbedOptions) { return this.embedBackend.embed(text, options); }
+  embedBatch(texts: string[], options?: EmbedOptions) { return this.embedBackend.embedBatch(texts, options); }
+  generate(prompt: string, options?: GenerateOptions) { return this.generateBackend.generate(prompt, options); }
+  modelExists(model: string) { return this.generateBackend.modelExists(model); }
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }) { return this.generateBackend.expandQuery(query, options); }
+  rerank(query: string, documents: RerankDocument[], options?: RerankOptions) { return this.rerankBackend.rerank(query, documents, options); }
+
+  // Chunking tokenizes with the embedding model's tokenizer.
+  get tokenize() { return this.embedBackend.tokenize?.bind(this.embedBackend); }
+  get detokenize() { return this.embedBackend.detokenize?.bind(this.embedBackend); }
+
+  // Absent when the reranker is remote: there is nothing to load or poison.
+  get prepareRerank() { return this.rerankBackend.prepareRerank?.bind(this.rerankBackend); }
+  get poison() { return this.rerankBackend.poison?.bind(this.rerankBackend); }
+
+  async dispose(): Promise<void> {
+    await Promise.all([...new Set([this.embedBackend, this.generateBackend, this.rerankBackend])].map(b => b.dispose()));
+  }
+}
+
+// =============================================================================
 // Backend selection
 // =============================================================================
 
@@ -2299,10 +2360,27 @@ export function createLlm(config: LlmConfig = {}): LLM {
     });
   }
   if (remote < 3) {
-    throw new Error(
-      `models.embed, models.generate and models.rerank must all be ${OPENAI_MODEL_PREFIX} URIs or all local models ` +
-      `(embed=${models.embed}, generate=${models.generate}, rerank=${models.rerank})`
-    );
+    // Mixed: each role goes to its own backend (e.g. remote rerank, local embed).
+    const uri: Record<LlmRole, string> = { embed: models.embed, generate: models.generate, rerank: models.rerank };
+    const remoteRoles = (Object.keys(uri) as LlmRole[]).filter(role => isOpenAiModelUri(uri[role]));
+    const remoteLlm = new OpenAiLLM({
+      embedModel: models.embed,
+      generateModel: models.generate,
+      rerankModel: models.rerank,
+      baseUrl: config.openaiBaseUrl,
+      apiKey: config.openaiApiKey,
+      generateParams: config.openaiGenerateParams,
+      roles: remoteRoles,
+    });
+    const localLlm = new LlamaCpp({
+      embedModel: remoteRoles.includes("embed") ? undefined : models.embed,
+      generateModel: remoteRoles.includes("generate") ? undefined : models.generate,
+      rerankModel: remoteRoles.includes("rerank") ? undefined : models.rerank,
+      inactivityTimeoutMs: config.inactivityTimeoutMs,
+      disposeModelsOnInactivity: config.disposeModelsOnInactivity,
+    });
+    const pick = (role: LlmRole): LLM => remoteRoles.includes(role) ? remoteLlm : localLlm;
+    return new CompositeLLM(pick("embed"), pick("generate"), pick("rerank"));
   }
   return new OpenAiLLM({
     embedModel: models.embed,

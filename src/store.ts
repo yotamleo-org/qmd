@@ -61,6 +61,7 @@ import {
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  isOpenAiModelUri,
   resolveRerankTimeoutMs,
   resolveRerankLoadTimeoutMs,
   RerankTimeoutError,
@@ -160,6 +161,14 @@ function cappedBodySql(column: string): string {
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
+
+/** Embed session TTL: QMD_EMBED_MAX_DURATION_MS (ms; 0 = no limit), else the 30 minute default. */
+export function resolveEmbedMaxDurationMs(): number {
+  const raw = process.env.QMD_EMBED_MAX_DURATION_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_EMBED_MAX_DURATION_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_EMBED_MAX_DURATION_MS;
+}
 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
@@ -2329,6 +2338,33 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
   }));
 }
 
+const EMBED_ESTIMATE_CHARS_PER_TOKEN = 3; // conservative for prose; the real count comes from the provider
+
+/**
+ * Dry-run for a full reindex (`qmd embed -f`): chunk every active document as
+ * a forced embed would (already-embedded ones included) and estimate the tokens
+ * a remote embedder would bill. Reads only; sends nothing.
+ */
+export function estimateCorpusEmbedTokens(db: Database, collection?: string): { docs: number; chunks: number; chars: number; estimatedTokens: number } {
+  const rows = db.prepare(`
+    SELECT d.hash, c.doc AS body
+    FROM documents d
+    JOIN content c ON d.hash = c.hash
+    WHERE d.active = 1 ${collection ? "AND d.collection = ?" : ""}
+    GROUP BY d.hash
+  `).all(...(collection ? [collection] : [])) as { hash: string; body: string }[];
+  let docs = 0, chunks = 0, chars = 0;
+  for (const row of rows) {
+    if (!row.body.trim()) continue;
+    docs++;
+    for (const chunk of chunkDocument(row.body)) {
+      chunks++;
+      chars += chunk.text.length;
+    }
+  }
+  return { docs, chunks, chars, estimatedTokens: Math.ceil(chars / EMBED_ESTIMATE_CHARS_PER_TOKEN) };
+}
+
 /**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
@@ -2345,6 +2381,16 @@ export async function generateEmbeddings(
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
+
+  // Vectors from different models are not comparable. A remote embedder never
+  // silently adds chunks next to another model's vectors; only a full forced
+  // re-embed (which clears them first) may switch the space.
+  if (isOpenAiModelUri(model) && !(options?.force && !options?.collection)) {
+    const other = db.prepare(`SELECT model, COUNT(*) AS n FROM content_vectors WHERE model != ? GROUP BY model ORDER BY n DESC LIMIT 1`).get(model) as { model: string; n: number } | undefined;
+    if (other) {
+      throw new Error(`Stored vectors use ${other.model} (${other.n} chunks) but the configured embedding model is ${model}. Vectors from different models are not comparable: run \`qmd embed -f\` to re-embed the whole corpus in the new space, or point models.embed back at the stored model.`);
+    }
+  }
 
   if (options?.force) {
     clearAllEmbeddings(db, options?.collection);
@@ -2597,7 +2643,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }, { maxDuration: options?.maxDurationMs ?? resolveEmbedMaxDurationMs(), name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
@@ -6423,7 +6469,7 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -6836,7 +6882,7 @@ export async function structuredSearch(
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {

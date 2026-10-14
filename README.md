@@ -1439,6 +1439,8 @@ llm_cache              -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
 | `QMD_OPENAI_BASE_URL` | unset | Endpoint for `openai:` models when `models.openai_base_url` is not set (see [Remote models](#remote-models-openai-compatible)) |
 | `QMD_OPENAI_API_KEY` | unset | Bearer token for that endpoint; takes precedence over `models.openai_api_key` |
+| `JINA_API_KEY` / `JINA_API` | unset | Bearer token used only when the endpoint is a `jina.ai` host |
+| `QMD_EMBED_MAX_DURATION_MS` | `1800000` | Embed session cap in ms (0 = no limit); `qmd embed --timeout` wins |
 
 ## How It Works
 
@@ -1584,11 +1586,31 @@ models:
     reasoning_effort: none                 # a reasoning model otherwise thinks through the whole budget
 ```
 
-All three roles must be `openai:` or all local; one backend per index.
-`QMD_OPENAI_BASE_URL` stands in for `openai_base_url`. With a remote backend
-`qmd pull` has nothing to download, `qmd doctor` probes the endpoint
-(`GET /models`) instead of the GPU, and embedding text is sent as-is (no
-EmbeddingGemma prefix). Vectors are stored under the `openai:` URI, so
+Each role is chosen separately: a role set to `openai:` goes to the endpoint,
+the others stay local (the default). Nothing is sent anywhere unless a role is
+configured that way. `QMD_OPENAI_BASE_URL` stands in for `openai_base_url`.
+`qmd pull` downloads only the local models, `qmd doctor` probes the endpoint
+(`GET /models`) when any role is remote, and embedding text is sent as-is (no
+EmbeddingGemma prefix).
+
+**Jina.** Remote rerank only, local vectors untouched (a remote reranker has no
+native call to hang, so a slow answer degrades to the unreranked order without
+restarting the daemon):
+
+```yaml
+models:
+  rerank: openai:jina-reranker-v2-base-multilingual
+  openai_base_url: https://api.jina.ai/v1
+```
+
+For a `jina.ai` host the key is read from `JINA_API_KEY` (or `JINA_API`) and is
+never sent to any other host; `QMD_OPENAI_API_KEY` still wins. Jina embeddings
+(`embed: openai:jina-embeddings-v3`) get the `retrieval.passage` /
+`retrieval.query` task field. A remote embed model never mixes with other
+stored vectors: embedding fails and names `qmd embed -f`, which re-embeds the
+whole corpus. `qmd embed --count-tokens` estimates the tokens of that full
+reindex without sending anything. `QMD_EMBED_MAX_DURATION_MS` sets the embed
+session cap (0 = no limit; default 30 minutes; `--timeout <minutes>` wins). Vectors are stored under the `openai:` URI, so
 switching backends is a model change like any other: `qmd embed -f`. A
 project-local `.qmd/index.yml` that sets `openai:` models or the endpoint is
 gated by `qmd trust` like any custom model, because it decides where your

@@ -36,6 +36,10 @@ global_context: "If you see a relevant [[WikiWord]], you can search for that Wik
 #   generate: "openai:gpt-4.1-mini"
 #   openai_base_url: "http://127.0.0.1:8080/v1"
 #   openai_api_key: "…"            # or the QMD_OPENAI_API_KEY env var
+#
+# Roles are independent: set only `rerank: "openai:jina-reranker-v2-base-multilingual"`
+# with `openai_base_url: "https://api.jina.ai/v1"` (key from JINA_API_KEY) to keep
+# embeddings local.
 
 # ─── Collections ─────────────────────────────────────────────────────────────
 collections:

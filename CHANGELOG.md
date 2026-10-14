@@ -13,6 +13,13 @@
 
 ### Added
 
+- Per-role remote models and Jina. A mix such as a remote `rerank` with local
+  `embed`/`generate` is now allowed (previously refused), so existing vectors
+  stay valid. `JINA_API_KEY`/`JINA_API` authenticate `jina.ai` endpoints only;
+  Jina embeddings send the `retrieval.passage`/`retrieval.query` task. A remote
+  embed model refuses to add vectors beside another model's (`qmd embed -f`).
+  `qmd embed --count-tokens` is a dry run for a full reindex;
+  `QMD_EMBED_MAX_DURATION_MS` sets the embed session cap.
 - OpenAI-compatible remote models. `models.embed`/`.rerank`/`.generate` accept
   `openai:<model id>` URIs served by `models.openai_base_url` (or
   `QMD_OPENAI_BASE_URL`) with an optional `openai_api_key` /
