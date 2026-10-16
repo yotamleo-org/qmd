@@ -2516,6 +2516,9 @@ describe("mcp http daemon", () => {
   let daemonCacheDir: string; // XDG_CACHE_HOME value (the qmd/ subdir is created automatically)
   let daemonDbPath: string;
   let daemonConfigDir: string;
+  let daemonTokenFile: string; // QMD_HTTP_TOKEN_FILE: the bearer token the HTTP server requires
+  const daemonToken = "d".repeat(64);
+  const authHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${daemonToken}` };
 
   // Track spawned PIDs for cleanup
   const spawnedPids: number[] = [];
@@ -2549,6 +2552,7 @@ describe("mcp http daemon", () => {
         INDEX_PATH: daemonDbPath,
         QMD_CONFIG_DIR: daemonConfigDir,
         PWD: fixturesDir,
+        QMD_HTTP_TOKEN_FILE: daemonTokenFile,
         ...options.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -2584,6 +2588,8 @@ describe("mcp http daemon", () => {
     await mkdir(join(daemonCacheDir, "qmd"), { recursive: true });
     await mkdir(daemonConfigDir, { recursive: true });
     await writeFile(join(daemonConfigDir, "index.yml"), "collections: {}\n");
+    daemonTokenFile = join(daemonTestDir, "http-token");
+    await writeFile(daemonTokenFile, daemonToken + "\n", { mode: 0o600 });
   });
 
   afterAll(async () => {
@@ -2676,7 +2682,7 @@ describe("mcp http daemon", () => {
 
       const res = await fetch(`http://localhost:${port}/query`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders,
         body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
       });
       expect(res.status).toBe(200);
@@ -2732,6 +2738,7 @@ describe("mcp http daemon", () => {
         env: {
           INDEX_PATH: "",
           XDG_CACHE_HOME: customCacheDir,
+          QMD_HTTP_TOKEN_FILE: daemonTokenFile,
         },
       },
     );
@@ -2753,7 +2760,7 @@ describe("mcp http daemon", () => {
 
       const res = await fetch(`http://localhost:${port}/query`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders,
         body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
       });
       expect(res.status).toBe(200);
