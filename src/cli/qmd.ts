@@ -2492,8 +2492,11 @@ async function vectorIndex(
         const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
         const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
         const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
+        const lat = info.latency && info.latency.count > 0
+          ? ` · req p50/p95/max ${info.latency.p50}/${info.latency.p95}/${info.latency.max}ms`
+          : "";
 
-        if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
+        if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput}${lat} · ETA ${eta}${c.reset}   `);
       },
     });
 
