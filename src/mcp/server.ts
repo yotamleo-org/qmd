@@ -199,6 +199,43 @@ async function buildInstructions(store: QMDStore): Promise<string> {
 }
 
 /**
+ * Admission gate for plain-text `query` calls. Their query expansion runs on a
+ * local model whose chat session serializes every call (~20 s each), so a burst
+ * queues past the client timeout. The gate admits a bounded number and refuses
+ * the rest at once; typed `searches` never expand and bypass it.
+ */
+export type ExpansionGate = {
+  /** Returns a leave function when admitted, or null when the queue is full. */
+  tryEnter(): (() => void) | null;
+  depth(): number;
+};
+
+export function createExpansionGate(max: number): ExpansionGate {
+  let active = 0;
+  return {
+    tryEnter() {
+      if (active >= max) return null;
+      active += 1;
+      let left = false;
+      return () => {
+        if (left) return;
+        left = true;
+        active -= 1;
+      };
+    },
+    depth: () => active,
+  };
+}
+
+function expansionQueueCap(): number {
+  const n = Number(process.env.QMD_EXPAND_MAX_QUEUED);
+  return Number.isInteger(n) && n >= 1 ? n : 3;
+}
+
+// One gate per process: the HTTP transport builds a server per request.
+const expansionGate = createExpansionGate(expansionQueueCap());
+
+/**
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
@@ -317,7 +354,7 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 
 | Goal | Approach |
 |------|----------|
-| General search (recommended) | Pass \`query\` — auto-expanded into typed variants, fused, reranked |
+| General search (recommended) | Pass \`query\` — auto-expanded into typed variants and fused (~20 s; busy answer when queued); add \`rerank: true\` to rerank |
 | Know exact term/name | \`lex\` only |
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
@@ -351,7 +388,7 @@ Intent-aware lex (C++ performance, not sports):
       inputSchema: z.object({
         query: z.string().optional().describe(
           "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
-          "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
+          "RRF (reranked only with rerank: true). Query expansion is slow (~20 s) and queued; when the server answers busy, use 'searches'. Mutually exclusive with 'searches'."
         ),
         searches: z.array(subSearchSchema).max(10).optional().describe(
           "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
@@ -375,8 +412,8 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
-        rerank: z.boolean().optional().default(true).describe(
-          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+        rerank: z.boolean().optional().default(false).describe(
+          "Rerank results with the reranker (default: false; adds ~20 s and a billed remote call). Pass true to opt in."
         ),
       }),
     },
@@ -412,16 +449,33 @@ Intent-aware lex (C++ performance, not sports):
         ? { query }
         : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
 
-      const results = await store.search({
-        ...searchOptions,
-        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-        filter: filterValidation.filter,
-        limit,
-        minScore,
-        candidateLimit,
-        rerank,
-        intent,
-      });
+      // Only a plain `query` expands; typed `searches` skip the serialized model.
+      let leave: (() => void) | null = () => {};
+      if (query) {
+        leave = expansionGate.tryEnter();
+        if (!leave) {
+          return {
+            content: [{ type: "text" as const, text: `Busy: ${expansionGate.depth()} plain-text queries are already queued for query expansion (~20 s each). Retry with typed 'searches' (lex + vec), which are not queued.` }],
+            isError: true,
+          };
+        }
+      }
+
+      let results;
+      try {
+        results = await store.search({
+          ...searchOptions,
+          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+          filter: filterValidation.filter,
+          limit,
+          minScore,
+          candidateLimit,
+          rerank,
+          intent,
+        });
+      } finally {
+        leave();
+      }
 
       // Use the plain query, or the first lex/vec sub-query, for snippet extraction
       const primaryQuery = query
