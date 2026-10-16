@@ -15,8 +15,28 @@
  *   - package.json test:bun / test:unit scripts for direct invocation
  * See CLAUDE.md for invoking `bun test` manually on darwin.
  */
-import { afterAll } from "bun:test";
+import { afterAll, vi } from "bun:test";
 import { disposeDefaultLlamaCpp } from "./llm";
+
+// bun:test's `vi` (what `import { vi } from "vitest"` resolves to under bun)
+// lacks stubGlobal/unstubAllGlobals; the fetch-stubbing suites need them.
+const bunVi = vi as unknown as Record<string, unknown>;
+if (typeof bunVi.stubGlobal !== "function") {
+  const saved = new Map<PropertyKey, PropertyDescriptor | undefined>();
+  bunVi.stubGlobal = (name: PropertyKey, value: unknown) => {
+    if (!saved.has(name)) saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+    Object.defineProperty(globalThis, name, { value, writable: true, configurable: true, enumerable: true });
+    return vi;
+  };
+  bunVi.unstubAllGlobals = () => {
+    for (const [name, desc] of saved) {
+      if (desc) Object.defineProperty(globalThis, name, desc);
+      else delete (globalThis as Record<PropertyKey, unknown>)[name];
+    }
+    saved.clear();
+    return vi;
+  };
+}
 
 // Global afterAll runs after all test files complete
 afterAll(async () => {
