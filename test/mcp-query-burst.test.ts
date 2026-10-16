@@ -9,8 +9,7 @@ import { _resetProductionModeForTesting } from "../src/store";
 const searchStub = vi.hoisted(() => ({ fn: null as null | ((opts: unknown) => Promise<unknown[]>) }));
 // oxlint-disable-next-line anti-slop/no-module-mocking -- store.search has no injection seam, replace under HIMMEL-5938
 vi.mock("../src/index.js", async (importOriginal) => {
-  // bun's mock factory gets no importOriginal and runs before the module is replaced.
-  const mod = await (typeof importOriginal === "function" ? importOriginal<typeof import("../src/index.js")>() : import("../src/index.js"));
+  const mod = await importOriginal<typeof import("../src/index.js")>();
   return {
     ...mod,
     createStore: async (...args: Parameters<typeof mod.createStore>) => {
