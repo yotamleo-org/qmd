@@ -17,6 +17,7 @@ import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  searchVecByCollection,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   verifySqliteVecLoaded,
@@ -5337,5 +5338,189 @@ describe("isDocid", () => {
 
   test("rejects paths that look like hex with extensions", () => {
     expect(isDocid("abc123.md")).toBe(false);
+  });
+});
+
+// =============================================================================
+// Vector scan fan-out: a scope that covers every collection is one scan
+// =============================================================================
+
+describe("Vector scan fan-out", () => {
+  async function seedThreeCollections(store: Store, dims: number) {
+    const names = ["alpha", "beta", "gamma"];
+    const now = new Date().toISOString();
+    store.ensureVecTable(dims);
+    for (const name of names) {
+      const coll = await createTestCollection({ name, pwd: `/test/${name}` });
+      // 25 per collection: past the structuredSearch list length, so no collection needs the exact fallback.
+      for (let i = 0; i < 25; i++) {
+        const hash = `${name}hash${i}`;
+        await insertTestDocument(store.db, coll, { name: `doc-${i}`, hash, body: `Doc ${name} ${i}`, displayPath: `doc-${i}.md` });
+        const embedding = new Float32Array(dims);
+        embedding[0] = 1;
+        embedding[1] = i / 1000;
+        store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+        store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
+      }
+    }
+    return names;
+  }
+
+  // One brute-force pass over vectors_vec is one prepared MATCH or vec_distance_cosine statement.
+  function countVecScans(store: Store) {
+    const realPrepare = store.db.prepare.bind(store.db);
+    let scans = 0;
+    (store.db as any).prepare = (sql: string) => {
+      if (/FROM vectors_vec/.test(sql) && /MATCH|vec_distance_cosine/.test(sql)) scans++;
+      return realPrepare(sql);
+    };
+    return () => scans;
+  }
+
+  test("searchVec over every collection scans the vectors once", async () => {
+    const store = await createTestStore();
+    const dims = 8;
+    const names = await seedThreeCollections(store, dims);
+    const scans = countVecScans(store);
+    const query = Array(dims).fill(0);
+    query[0] = 1;
+
+    const results = await store.searchVec("ignored", "test-model", 5, names, undefined, query);
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(scans()).toBe(1);
+    await cleanupTestDb(store);
+  });
+
+  test("structuredSearch over every collection scans the vectors once", async () => {
+    const store = await createTestStore();
+    const dims = 8;
+    const names = await seedThreeCollections(store, dims);
+    const query = Array(dims).fill(0);
+    query[0] = 1;
+    store.llm = {
+      embedModelName: "test-model",
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: query, model: "test-model" })),
+    } as any;
+    const scans = countVecScans(store);
+
+    const results = await structuredSearch(store, [{ type: "vec", query: "anything" }], {
+      collections: names, limit: 5, skipRerank: true,
+    });
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(scans()).toBe(1);
+    await cleanupTestDb(store);
+  });
+
+  test("a scope that leaves a collection out still scans per collection and excludes it", async () => {
+    const store = await createTestStore();
+    const dims = 8;
+    await seedThreeCollections(store, dims);
+    const query = Array(dims).fill(0);
+    query[0] = 1;
+
+    const results = await store.searchVec("ignored", "test-model", 20, ["alpha", "beta"], undefined, query);
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.every((r) => r.collectionName !== "gamma")).toBe(true);
+    await cleanupTestDb(store);
+  });
+
+  test("structuredSearch over every collection still gives a small collection its own vec candidates", async () => {
+    const store = await createTestStore();
+    const dims = 8;
+    const now = new Date().toISOString();
+    store.ensureVecTable(dims);
+    const seed = async (name: string, count: number, axis: number) => {
+      const coll = await createTestCollection({ name, pwd: `/test/${name}` });
+      for (let i = 0; i < count; i++) {
+        const hash = `${name}hash${i}`;
+        await insertTestDocument(store.db, coll, { name: `doc-${i}`, hash, body: `Doc ${name} ${i}`, displayPath: `doc-${i}.md` });
+        const embedding = new Float32Array(dims);
+        embedding[axis] = 1;
+        embedding[1] = i / 1000;
+        store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+        store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
+      }
+    };
+    // 80 near vectors fill any global top-k of 60; the small collection's one vector is far.
+    await seed("big", 80, 0);
+    await seed("tiny", 1, 5);
+    const query = Array(dims).fill(0);
+    query[0] = 1;
+    store.llm = {
+      embedModelName: "test-model",
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: query, model: "test-model" })),
+    } as any;
+
+    const results = await structuredSearch(store, [{ type: "vec", query: "anything" }], {
+      collections: ["big", "tiny"], limit: 200, candidateLimit: 200, skipRerank: true,
+    });
+
+    expect(results.some((r) => r.file.startsWith("qmd://tiny/"))).toBe(true);
+    await cleanupTestDb(store);
+  });
+
+  test("a collection outside the scan pool still gets its full exact list", async () => {
+    const store = await createTestStore();
+    const dims = 8;
+    const now = new Date().toISOString();
+    store.ensureVecTable(dims);
+    const seed = async (name: string, count: number, axis: number) => {
+      const coll = await createTestCollection({ name, pwd: `/test/${name}` });
+      for (let i = 0; i < count; i++) {
+        const hash = `${name}hash${i}`;
+        await insertTestDocument(store.db, coll, { name: `doc-${i}`, hash, body: `Doc ${name} ${i}`, displayPath: `doc-${i}.md` });
+        const embedding = new Float32Array(dims);
+        embedding[axis] = 1;
+        embedding[1] = i / 1000;
+        store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+        store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
+      }
+    };
+    // 60 near vectors fill a pool of 10 (k = 30); the far collection's 3 are outside it.
+    await seed("big", 60, 0);
+    await seed("far", 3, 5);
+    const query = Array(dims).fill(0);
+    query[0] = 1;
+
+    const lists = await searchVecByCollection(store.db, "ignored", "test-model", 5, ["big", "far"], undefined, query, undefined, undefined, 10);
+
+    const far = lists.find((list) => list[0]?.collectionName === "far");
+    expect(far?.length).toBe(3);
+    expect(lists.find((list) => list[0]?.collectionName === "big")?.length).toBe(5);
+    await cleanupTestDb(store);
+  });
+
+  test("a collection that turns active between the coverage check and the scan stays out", async () => {
+    const store = await createTestStore();
+    const dims = 8;
+    const names = await seedThreeCollections(store, dims);
+    const late = await createTestCollection({ name: "late", pwd: "/test/late" });
+    await insertTestDocument(store.db, late, { name: "doc-0", hash: "latehash0", body: "Doc late", displayPath: "doc-0.md", active: 0 });
+    const embedding = new Float32Array(dims);
+    embedding[0] = 1;
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run("latehash0", new Date().toISOString());
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run("latehash0_0", embedding);
+
+    const realPrepare = store.db.prepare.bind(store.db);
+    (store.db as any).prepare = (sql: string) => {
+      const stmt = realPrepare(sql);
+      if (!/SELECT DISTINCT collection FROM documents/.test(sql)) return stmt;
+      return { all: (...args: unknown[]) => {
+        const rows = stmt.all(...args);
+        realPrepare(`UPDATE documents SET active = 1 WHERE collection = 'late'`).run();
+        return rows;
+      } };
+    };
+    const query = Array(dims).fill(0);
+    query[0] = 1;
+
+    const results = await store.searchVec("ignored", "test-model", 20, names, undefined, query);
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.every((r) => r.collectionName !== "late")).toBe(true);
+    await cleanupTestDb(store);
   });
 });
