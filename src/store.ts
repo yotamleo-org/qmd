@@ -4151,6 +4151,16 @@ function scopedCollectionNames(scope: CollectionScope): string[] | undefined {
   return names.length > 0 ? names : undefined;
 }
 
+/**
+ * True when `names` includes every collection that holds an active document.
+ * A scope that leaves nothing out filters nothing, so the caller can run one
+ * unscoped scan instead of one full vector scan per collection.
+ */
+function scopeCoversAllCollections(db: Database, names: readonly string[]): boolean {
+  const held = db.prepare(`SELECT DISTINCT collection FROM documents WHERE active = 1`).all() as { collection: string }[];
+  return held.every(row => names.includes(row.collection));
+}
+
 function mergeSearchResultsByScore(lists: SearchResult[][], limit: number): SearchResult[] {
   const best = new Map<string, SearchResult>();
   for (const list of lists) {
@@ -4326,7 +4336,8 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
 
-  const names = scopedCollectionNames(collectionName);
+  let names = scopedCollectionNames(collectionName);
+  if (names && scopeCoversAllCollections(db, names)) names = undefined;
   if (names && names.length > 1) {
     const lists = await Promise.all(
       names.map(name => searchVec(db, query, model, limit, name, session, embedding, llm, filter)),
@@ -6183,6 +6194,8 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
+      // A scope that covers every collection is one scan over the vectors, not one per collection.
+      const vecCollectionList = collections && scopeCoversAllCollections(store.db, collections) ? [undefined] : collectionList;
       const llm = getLlm(store);
       const embedModel = llm.embedModelName;
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
@@ -6195,7 +6208,7 @@ export async function structuredSearch(
         const embedding = embeddings[i]?.embedding;
         if (!embedding) continue;
 
-        for (const coll of collectionList) {
+        for (const coll of vecCollectionList) {
           const vecResults = await store.searchVec(
             vecSearches[i]!.query, embedModel, 20, coll,
             undefined, embedding, filter
