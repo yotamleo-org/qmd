@@ -74,6 +74,30 @@ describe("withRetry", () => {
     expect(calls).toBe(3);
   });
 
+  test("retries network errors and timeouts (status 0) through the same bounded budget", async () => {
+    const seen: number[] = [];
+    let calls = 0;
+    const result = await withRetry(async () => {
+      calls++;
+      if (calls === 1) throw new TypeError("fetch failed", { cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }) });
+      if (calls === 2) throw new DOMException("The operation timed out", "TimeoutError");
+      return "ok";
+    }, { sleep: async () => {}, onRetry: status => { seen.push(status); } });
+    expect(result).toBe("ok");
+    expect(calls).toBe(3);
+    expect(seen).toEqual([0, 0]);
+
+    calls = 0;
+    await expect(withRetry(async () => { calls++; throw new TypeError("fetch failed"); }, { sleep: async () => {} }))
+      .rejects.toThrow(/fetch failed/);
+    expect(calls).toBe(6);
+
+    calls = 0;
+    await expect(withRetry(async () => { calls++; throw new SyntaxError("bad json"); }, { sleep: async () => {} }))
+      .rejects.toThrow(/bad json/);
+    expect(calls).toBe(1);
+  });
+
   test("backoff is capped at maxMs and onRetry sees each retried status", async () => {
     const waits: number[] = [];
     const seen: number[] = [];
@@ -180,5 +204,18 @@ describe("runPool", () => {
       if (job === 1) throw new Error("job 1 failed");
     }, { value: 2 })).rejects.toThrow(/job 1 failed/);
     expect(finished).toBeGreaterThanOrEqual(2);
+  });
+
+  test("a throwing next() rejects only after in-flight jobs have finished", async () => {
+    let n = 0;
+    let finished = 0;
+    await expect(runPool(async () => {
+      if (n === 2) throw new Error("chunking failed");
+      return n++;
+    }, async () => {
+      await sleepFor(30);
+      finished++;
+    }, { value: 4 })).rejects.toThrow(/chunking failed/);
+    expect(finished).toBe(2);
   });
 });

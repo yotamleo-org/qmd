@@ -35,6 +35,20 @@ export function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+const NETWORK_ERROR_CODES = new Set([
+  "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH",
+  "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+]);
+
+/** A failure with no HTTP answer: fetch rejected, the socket dropped or the request timed out. */
+export function isNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === "TimeoutError" || error.name === "AbortError") return true;
+  if (error instanceof TypeError && /fetch failed|network|terminated/i.test(error.message)) return true;
+  const code = (error as { code?: unknown }).code ?? (error.cause as { code?: unknown } | undefined)?.code;
+  return typeof code === "string" && NETWORK_ERROR_CODES.has(code);
+}
+
 export type RetryOptions = {
   /** Retries after the first attempt. */
   retries?: number;
@@ -43,7 +57,7 @@ export type RetryOptions = {
   sleep?: (ms: number) => Promise<void>;
   /** Uniform [0, 1) source for jitter. */
   random?: () => number;
-  /** Called with the status of each failure that is about to be retried. */
+  /** Called with the status of each failure about to be retried (0 for a network error or timeout). */
   onRetry?: (status: number) => void;
 };
 
@@ -51,8 +65,8 @@ const defaultSleep = (ms: number) => new Promise<void>(resolve => setTimeout(res
 
 /**
  * Run `fn`, retrying 429 and 5xx answers with exponential backoff and jitter
- * (honouring `Retry-After`). Every other error, including network failures
- * that carry no status, is thrown at once.
+ * (honouring `Retry-After`). Network errors and timeouts (status 0) share the
+ * same budget. Every other error is thrown at once.
  */
 export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
   const retries = options.retries ?? 5;
@@ -64,10 +78,12 @@ export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions =
     try {
       return await fn();
     } catch (error) {
-      if (!(error instanceof HttpStatusError) || !isRetryableStatus(error.status) || attempt >= retries) throw error;
-      options.onRetry?.(error.status);
+      const http = error instanceof HttpStatusError ? error : undefined;
+      const retryable = http ? isRetryableStatus(http.status) : isNetworkError(error);
+      if (!retryable || attempt >= retries) throw error;
+      options.onRetry?.(http?.status ?? 0);
       const backoff = Math.min(maxMs, baseMs * 2 ** attempt) * (0.5 + random());
-      await sleep(error.retryAfterMs !== undefined ? Math.min(error.retryAfterMs, maxMs) : Math.min(maxMs, backoff));
+      await sleep(http?.retryAfterMs !== undefined ? Math.min(http.retryAfterMs, maxMs) : Math.min(maxMs, backoff));
     }
   }
 }
@@ -155,7 +171,14 @@ export async function runPool<T>(
       await new Promise<void>(resolve => { wake = resolve; });
     }
     if (shouldStop() || failure) break;
-    const job = await next();
+    let job: T | undefined;
+    try {
+      job = await next();
+    } catch (error) {
+      // Let requests already in flight finish (and commit) before rejecting.
+      await Promise.all(running);
+      throw error;
+    }
     if (job === undefined) break;
     active++;
     const task: Promise<void> = run(job)
