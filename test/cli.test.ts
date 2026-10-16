@@ -15,6 +15,7 @@ import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
+import { getEmbeddingFingerprint } from "../src/store.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
 
@@ -1261,6 +1262,32 @@ describe("CLI Update Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Updating");
   });
+
+  test("update hint counts pending hashes for the configured embed model, like status", async () => {
+    const customModel = "hf:example/custom-embed/custom.gguf";
+    const env = { QMD_EMBED_MODEL: customModel };
+    const configPath = join(testConfigDir, "index.yml");
+    const configText = readFileSync(configPath, "utf8");
+    // The CLI persists resolved models into the config, which wins over the env var.
+    writeFileSync(configPath, configText.replace(/^(\s*embed:).*$/m, `$1 ${customModel}`));
+
+    // Every active doc is already embedded under the configured model.
+    const db = openDatabase(localDbPath);
+    const hashes = db.prepare(`SELECT DISTINCT hash FROM documents WHERE active = 1`).all() as { hash: string }[];
+    expect(hashes.length).toBeGreaterThan(0);
+    const now = new Date().toISOString();
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+      VALUES (?, 0, 0, ?, ?, 1, ?)
+    `);
+    const fingerprint = getEmbeddingFingerprint(customModel);
+    for (const { hash } of hashes) insert.run(hash, customModel, fingerprint, now);
+    db.close();
+
+    const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath, env });
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toContain("unique hashes need vectors");
+  }, 30000);
 
   test("deactivates stale docs when collection has zero matching files", async () => {
     const { dbPath, configDir } = await createIsolatedTestEnv("update-empty");
