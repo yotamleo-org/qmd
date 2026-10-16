@@ -19,7 +19,11 @@ import { afterAll, vi } from "bun:test";
 import { disposeDefaultLlamaCpp } from "./llm";
 
 // bun:test's `vi` (what `import { vi } from "vitest"` resolves to under bun)
-// lacks stubGlobal/unstubAllGlobals; the fetch-stubbing suites need them.
+// lacks hoisted/stubGlobal/unstubAllGlobals; the mocking suites need them.
+if (!("hoisted" in vi)) {
+  Object.assign(vi, { hoisted: <T>(factory: () => T): T => factory() });
+}
+
 if (!("stubGlobal" in vi)) {
   const saved = new Map<PropertyKey, PropertyDescriptor | undefined>();
   Object.assign(vi, {
