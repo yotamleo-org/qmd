@@ -300,6 +300,73 @@ function expansionQueueCap(): number {
 const expansionGate = createExpansionGate(expansionQueueCap());
 
 /**
+ * Serial admission queue for typed `query` searches that embed (vec, hyde);
+ * plain-text calls are capped by the expansion gate. The embedder and chat model answer one call at a time (~30 s each), so
+ * a burst of N waits N x 30 s past the client timeout. At most `max` calls are
+ * held (one running, the rest waiting); a call past that is refused at once. A
+ * waiting call whose client cancelled leaves the queue and never starts.
+ */
+export type QueryQueueTicket = { ok: true; release: () => void } | { ok: false; reason: "busy" | "cancelled" };
+export type QueryQueue = {
+  acquire(signal?: AbortSignal): Promise<QueryQueueTicket>;
+  /** Calls held: the running one plus those waiting. */
+  depth(): number;
+};
+
+export function createQueryQueue(max: number): QueryQueue {
+  let held = 0;
+  let running = false;
+  const waiting: Array<() => void> = [];
+  const ticket = (): QueryQueueTicket => {
+    running = true;
+    let done = false;
+    return {
+      ok: true,
+      release: () => {
+        if (done) return;
+        done = true;
+        held -= 1;
+        running = false;
+        const next = waiting.shift();
+        if (next) next();
+      },
+    };
+  };
+  return {
+    acquire(signal) {
+      if (signal?.aborted) return Promise.resolve({ ok: false, reason: "cancelled" });
+      if (held >= max) return Promise.resolve({ ok: false, reason: "busy" });
+      held += 1;
+      if (!running) return Promise.resolve(ticket());
+      return new Promise<QueryQueueTicket>((resolve) => {
+        const onAbort = () => {
+          const i = waiting.indexOf(start);
+          if (i < 0) return;
+          waiting.splice(i, 1);
+          held -= 1;
+          resolve({ ok: false, reason: "cancelled" });
+        };
+        const start = () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve(ticket());
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        waiting.push(start);
+      });
+    },
+    depth: () => held,
+  };
+}
+
+function queryQueueCap(): number {
+  const n = Number(process.env.QMD_QUERY_MAX_QUEUED);
+  return Number.isInteger(n) && n >= 1 ? n : 3;
+}
+
+// One queue per process, like the expansion gate.
+const queryQueue = createQueryQueue(queryQueueCap());
+
+/**
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
@@ -483,7 +550,7 @@ Intent-aware lex (C++ performance, not sports):
         ),
       }),
     },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }) => {
+    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }, extra) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -527,6 +594,26 @@ Intent-aware lex (C++ performance, not sports):
         }
       }
 
+      // Typed searches that embed (vec, hyde) wait their turn on the one model;
+      // lex-only searches never touch it, and plain `query` has its own gate above.
+      let releaseQueue: () => void = () => {};
+      if (!query && searches?.some(s => s.type !== "lex")) {
+        const turn = await queryQueue.acquire(extra?.mcpReq?.signal);
+        if (!turn.ok) {
+          leave();
+          return {
+            content: [{
+              type: "text" as const,
+              text: turn.reason === "busy"
+                ? `Busy: ${queryQueue.depth()} queries are already queued (~30 s each). Retry shortly, or use a lex-only search.`
+                : "Cancelled before it started.",
+            }],
+            isError: true,
+          };
+        }
+        releaseQueue = turn.release;
+      }
+
       let results;
       try {
         results = await store.search({
@@ -541,6 +628,7 @@ Intent-aware lex (C++ performance, not sports):
         });
       } finally {
         leave();
+        releaseQueue();
       }
 
       // Use the plain query, or the first lex/vec sub-query, for snippet extraction
