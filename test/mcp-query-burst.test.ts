@@ -7,6 +7,7 @@ import { _resetProductionModeForTesting } from "../src/store";
 
 // Lets one test replace store.search; every other call reaches the real store.
 const searchStub = vi.hoisted(() => ({ fn: null as null | ((opts: unknown) => Promise<unknown[]>) }));
+// oxlint-disable-next-line anti-slop/no-module-mocking -- store.search has no injection seam, replace under HIMMEL-5938
 vi.mock("../src/index.js", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../src/index.js")>();
   return {

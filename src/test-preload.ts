@@ -15,8 +15,33 @@
  *   - package.json test:bun / test:unit scripts for direct invocation
  * See CLAUDE.md for invoking `bun test` manually on darwin.
  */
-import { afterAll } from "bun:test";
+import { afterAll, vi } from "bun:test";
 import { disposeDefaultLlamaCpp } from "./llm.js";
+
+// bun:test's `vi` (what `import { vi } from "vitest"` resolves to under bun)
+// lacks hoisted/stubGlobal/unstubAllGlobals; the mocking suites need them.
+if (!("hoisted" in vi)) {
+  Object.assign(vi, { hoisted: <T>(factory: () => T): T => factory() });
+}
+
+if (!("stubGlobal" in vi)) {
+  const saved = new Map<PropertyKey, PropertyDescriptor | undefined>();
+  Object.assign(vi, {
+    stubGlobal(name: PropertyKey, value: unknown) {
+      if (!saved.has(name)) saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+      Object.defineProperty(globalThis, name, { value, writable: true, configurable: true, enumerable: true });
+      return vi;
+    },
+    unstubAllGlobals() {
+      for (const [name, desc] of saved) {
+        if (desc) Object.defineProperty(globalThis, name, desc);
+        else Reflect.deleteProperty(globalThis, name);
+      }
+      saved.clear();
+      return vi;
+    },
+  });
+}
 
 // Global afterAll runs after all test files complete
 afterAll(async () => {
