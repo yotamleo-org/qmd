@@ -1556,6 +1556,7 @@ export type Store = {
   // Search
   searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => Promise<SearchResult[]>;
+  searchVecByCollection: (query: string, model: string, limit: number, names: readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => Promise<SearchResult[][]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -2371,6 +2372,7 @@ export function createStore(dbPath?: string): Store {
     // Search
     searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], filter?: MetadataFilter) => searchFTS(db, query, limit, collectionName, filter),
     searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store), filter),
+    searchVecByCollection: (query: string, model: string, limit: number, names: readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], filter?: MetadataFilter) => searchVecByCollection(db, query, model, limit, names, session, precomputedEmbedding, getLlm(store), filter),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
@@ -4337,7 +4339,13 @@ export async function searchVec(db: Database, query: string, model: string, limi
   if (!embedding) return [];
 
   let names = scopedCollectionNames(collectionName);
-  if (names && scopeCoversAllCollections(db, names)) names = undefined;
+  // Full coverage runs one unscoped scan; rows are still checked against the
+  // requested names, since a collection can appear between the check and the scan.
+  let collapsedFrom: ReadonlySet<string> | undefined;
+  if (names && scopeCoversAllCollections(db, names)) {
+    collapsedFrom = new Set(names);
+    names = undefined;
+  }
   if (names && names.length > 1) {
     const lists = await Promise.all(
       names.map(name => searchVec(db, query, model, limit, name, session, embedding, llm, filter)),
@@ -4457,6 +4465,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
   }
 
   return Array.from(seen.values())
+    .filter(({ row }) => !collapsedFrom || collapsedFrom.has(row.filepath.split('//')[1]?.split('/')[0] || ""))
     .sort((a, b) => a.bestDist - b.bestDist)
     .slice(0, limit)
     .map(({ row, bestDist }) => {
@@ -4478,6 +4487,31 @@ export async function searchVec(db: Database, query: string, model: string, limi
         chunkPos: row.pos,
       };
     });
+}
+
+// How many documents the one covering scan returns so each collection can still
+// fill its own top list; sqlite-vec caps the scan at k = 4096 (3 x this).
+const COVERED_SCAN_POOL = 1000;
+
+/**
+ * One ranked list per requested collection (empty ones omitted). When `names`
+ * covers every collection this is one vector scan split by collection, so a
+ * small collection keeps its own candidates; otherwise one scan per collection.
+ */
+export async function searchVecByCollection(db: Database, query: string, model: string, limit: number, names: readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, filter?: MetadataFilter): Promise<SearchResult[][]> {
+  if (!scopeCoversAllCollections(db, names)) {
+    const lists = await Promise.all(
+      names.map(name => searchVec(db, query, model, limit, name, session, precomputedEmbedding, llm, filter)),
+    );
+    return lists.filter(list => list.length > 0);
+  }
+  const pool = await searchVec(db, query, model, Math.max(limit, COVERED_SCAN_POOL), names, session, precomputedEmbedding, llm, filter);
+  const byCollection = new Map<string, SearchResult[]>(names.map(name => [name, []]));
+  for (const r of pool) {
+    const list = byCollection.get(r.collectionName);
+    if (list && list.length < limit) list.push(r);
+  }
+  return Array.from(byCollection.values()).filter(list => list.length > 0);
 }
 
 // =============================================================================
@@ -6194,8 +6228,6 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      // A scope that covers every collection is one scan over the vectors, not one per collection.
-      const vecCollectionList = collections && scopeCoversAllCollections(store.db, collections) ? [undefined] : collectionList;
       const llm = getLlm(store);
       const embedModel = llm.embedModelName;
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
@@ -6208,11 +6240,12 @@ export async function structuredSearch(
         const embedding = embeddings[i]?.embedding;
         if (!embedding) continue;
 
-        for (const coll of vecCollectionList) {
-          const vecResults = await store.searchVec(
-            vecSearches[i]!.query, embedModel, 20, coll,
-            undefined, embedding, filter
-          );
+        // One ranked list per collection either way; a scope covering every
+        // collection gets them from a single vector scan.
+        const vecLists = collections
+          ? await store.searchVecByCollection(vecSearches[i]!.query, embedModel, 20, collections, undefined, embedding, filter)
+          : [await store.searchVec(vecSearches[i]!.query, embedModel, 20, undefined, undefined, embedding, filter)];
+        for (const vecResults of vecLists) {
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
             rankedLists.push(vecResults.map(r => ({
