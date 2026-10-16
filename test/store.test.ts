@@ -17,6 +17,7 @@ import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  searchVecByCollection,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   verifySqliteVecLoaded,
@@ -5351,11 +5352,13 @@ describe("Vector scan fan-out", () => {
     store.ensureVecTable(dims);
     for (const name of names) {
       const coll = await createTestCollection({ name, pwd: `/test/${name}` });
-      for (let i = 0; i < 3; i++) {
+      // 25 per collection: past the structuredSearch list length, so no collection needs the exact fallback.
+      for (let i = 0; i < 25; i++) {
         const hash = `${name}hash${i}`;
         await insertTestDocument(store.db, coll, { name: `doc-${i}`, hash, body: `Doc ${name} ${i}`, displayPath: `doc-${i}.md` });
         const embedding = new Float32Array(dims);
-        embedding[i % dims] = 1;
+        embedding[0] = 1;
+        embedding[1] = i / 1000;
         store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
         store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
       }
@@ -5456,6 +5459,37 @@ describe("Vector scan fan-out", () => {
     });
 
     expect(results.some((r) => r.file.startsWith("qmd://tiny/"))).toBe(true);
+    await cleanupTestDb(store);
+  });
+
+  test("a collection outside the scan pool still gets its full exact list", async () => {
+    const store = await createTestStore();
+    const dims = 8;
+    const now = new Date().toISOString();
+    store.ensureVecTable(dims);
+    const seed = async (name: string, count: number, axis: number) => {
+      const coll = await createTestCollection({ name, pwd: `/test/${name}` });
+      for (let i = 0; i < count; i++) {
+        const hash = `${name}hash${i}`;
+        await insertTestDocument(store.db, coll, { name: `doc-${i}`, hash, body: `Doc ${name} ${i}`, displayPath: `doc-${i}.md` });
+        const embedding = new Float32Array(dims);
+        embedding[axis] = 1;
+        embedding[1] = i / 1000;
+        store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+        store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
+      }
+    };
+    // 60 near vectors fill a pool of 10 (k = 30); the far collection's 3 are outside it.
+    await seed("big", 60, 0);
+    await seed("far", 3, 5);
+    const query = Array(dims).fill(0);
+    query[0] = 1;
+
+    const lists = await searchVecByCollection(store.db, "ignored", "test-model", 5, ["big", "far"], undefined, query, undefined, undefined, 10);
+
+    const far = lists.find((list) => list[0]?.collectionName === "far");
+    expect(far?.length).toBe(3);
+    expect(lists.find((list) => list[0]?.collectionName === "big")?.length).toBe(5);
     await cleanupTestDb(store);
   });
 

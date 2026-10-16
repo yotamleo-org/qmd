@@ -4497,21 +4497,25 @@ const COVERED_SCAN_POOL = 1000;
  * One ranked list per requested collection (empty ones omitted). When `names`
  * covers every collection this is one vector scan split by collection, so a
  * small collection keeps its own candidates; otherwise one scan per collection.
+ * A collection holding `limit` documents in the globally sorted pool already has
+ * its true top list; any other gets the exact per-collection search.
  */
-export async function searchVecByCollection(db: Database, query: string, model: string, limit: number, names: readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, filter?: MetadataFilter): Promise<SearchResult[][]> {
+export async function searchVecByCollection(db: Database, query: string, model: string, limit: number, names: readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, filter?: MetadataFilter, poolSize: number = COVERED_SCAN_POOL): Promise<SearchResult[][]> {
   if (!scopeCoversAllCollections(db, names)) {
     const lists = await Promise.all(
       names.map(name => searchVec(db, query, model, limit, name, session, precomputedEmbedding, llm, filter)),
     );
     return lists.filter(list => list.length > 0);
   }
-  const pool = await searchVec(db, query, model, Math.max(limit, COVERED_SCAN_POOL), names, session, precomputedEmbedding, llm, filter);
+  const pool = await searchVec(db, query, model, Math.max(limit, poolSize), names, session, precomputedEmbedding, llm, filter);
   const byCollection = new Map<string, SearchResult[]>(names.map(name => [name, []]));
   for (const r of pool) {
     const list = byCollection.get(r.collectionName);
     if (list && list.length < limit) list.push(r);
   }
-  return Array.from(byCollection.values()).filter(list => list.length > 0);
+  const lists = await Promise.all(Array.from(byCollection, ([name, list]) =>
+    list.length >= limit ? list : searchVec(db, query, model, limit, name, session, precomputedEmbedding, llm, filter)));
+  return lists.filter(list => list.length > 0);
 }
 
 // =============================================================================
