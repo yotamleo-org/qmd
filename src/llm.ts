@@ -81,6 +81,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
 import { createRequire } from "node:module";
+import { HttpStatusError, parseRetryAfterMs, readPositiveIntEnv, withRetry } from "./embed-pool.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -221,6 +222,8 @@ export type EmbedOptions = {
   model?: string;
   isQuery?: boolean;
   title?: string;
+  /** Called with the status of each request the remote backend retried (429/5xx). */
+  onThrottle?: (status: number) => void;
 };
 
 /**
@@ -666,6 +669,11 @@ export interface LLM {
   readonly embedModelName: string;
   readonly generateModelName: string;
   readonly rerankModelName: string;
+  /**
+   * Request size and requests in flight a remote embedder takes. Absent on a
+   * local backend, which embeds one request at a time.
+   */
+  readonly embedTuning?: { batchSize: number; concurrency: number };
 
   /**
    * Get embeddings for text
@@ -2097,6 +2105,16 @@ export function isJinaEndpoint(baseUrl: string): boolean {
   }
 }
 
+/** Whether the endpoint is OpenRouter, which routes an embedding request by provider. */
+export function isOpenRouterEndpoint(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname;
+    return host === "openrouter.ai" || host.endsWith(".openrouter.ai");
+  } catch {
+    return false;
+  }
+}
+
 /** The Jina key (JINA_API_KEY, else JINA_API), only ever handed to a jina.ai endpoint. */
 function jinaKeyFor(baseUrl: string): string | undefined {
   return isJinaEndpoint(baseUrl) ? (process.env.JINA_API_KEY || process.env.JINA_API || undefined) : undefined;
@@ -2104,9 +2122,12 @@ function jinaKeyFor(baseUrl: string): string | undefined {
 
 // The smallest per-request `input` limit among common embedding providers
 // (DashScope rejects more than 10). Servers with a higher limit just take more
-// round trips, and OPENAI_EMBED_CONCURRENCY requests in flight make up for it.
-const OPENAI_EMBED_BATCH_SIZE = 10;
-const OPENAI_EMBED_CONCURRENCY = 4;
+// round trips, and the concurrency below makes up for it. QMD_OPENAI_EMBED_BATCH_SIZE
+// and QMD_OPENAI_EMBED_CONCURRENCY raise them for endpoints that take more.
+const OPENAI_EMBED_BATCH_SIZE_DEFAULT = 10;
+const OPENAI_EMBED_CONCURRENCY_DEFAULT = 4;
+const OPENAI_EMBED_BATCH_SIZE_MAX = 512;
+const OPENAI_EMBED_CONCURRENCY_MAX = 128;
 const OPENAI_REQUEST_TIMEOUT_MS = 120_000;
 
 // A general chat model has never seen qmd's fine-tuned expansion format, so
@@ -2165,6 +2186,13 @@ export class OpenAiLLM implements LLM {
     return this.baseUrl;
   }
 
+  get embedTuning(): { batchSize: number; concurrency: number } {
+    return {
+      batchSize: readPositiveIntEnv("QMD_OPENAI_EMBED_BATCH_SIZE", OPENAI_EMBED_BATCH_SIZE_DEFAULT, OPENAI_EMBED_BATCH_SIZE_MAX),
+      concurrency: readPositiveIntEnv("QMD_OPENAI_EMBED_CONCURRENCY", OPENAI_EMBED_CONCURRENCY_DEFAULT, OPENAI_EMBED_CONCURRENCY_MAX),
+    };
+  }
+
   /** The id the server knows: the URI without its `openai:` prefix. */
   private modelId(uri: string): string {
     return uri.slice(OPENAI_MODEL_PREFIX.length);
@@ -2186,7 +2214,7 @@ export class OpenAiLLM implements LLM {
     });
     if (!response.ok) {
       const detail = (await response.text().catch(() => "")).slice(0, 300);
-      throw new Error(`${url} answered ${response.status}${detail ? `: ${detail}` : ""}`);
+      throw new HttpStatusError(response.status, `${url} answered ${response.status}${detail ? `: ${detail}` : ""}`, parseRetryAfterMs(response.headers.get("retry-after")));
     }
     return await response.json() as T;
   }
@@ -2205,24 +2233,32 @@ export class OpenAiLLM implements LLM {
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     const model = options.model ?? this.embedModelUri;
     const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
-    const batchCount = Math.ceil(texts.length / OPENAI_EMBED_BATCH_SIZE);
+    const { batchSize, concurrency } = this.embedTuning;
+    const batchCount = Math.ceil(texts.length / batchSize);
+    // Bulk embeds on OpenRouter pin one provider with no fallback (a slow one
+    // can cost 3x the throughput); queries keep OpenRouter's fallbacks.
+    const provider = process.env.QMD_OPENAI_PROVIDER;
+    const pin = provider && !options.isQuery && isOpenRouterEndpoint(this.baseUrl)
+      ? { provider: { order: [provider], allow_fallbacks: false } }
+      : {};
     let nextBatch = 0;
     const worker = async () => {
       while (nextBatch < batchCount) {
-        const offset = nextBatch++ * OPENAI_EMBED_BATCH_SIZE;
-        const input = texts.slice(offset, offset + OPENAI_EMBED_BATCH_SIZE);
-        const data = await this.request<{ data: { index: number; embedding: number[] }[] }>("/embeddings", {
+        const offset = nextBatch++ * batchSize;
+        const input = texts.slice(offset, offset + batchSize);
+        const data = await withRetry(() => this.request<{ data: { index: number; embedding: number[] }[] }>("/embeddings", {
           model: this.modelId(this.embedModelUri),
           input,
           // Jina's retrieval embedders are trained per task; the text itself stays raw.
           ...(isJinaEndpoint(this.baseUrl) ? { task: options.isQuery ? "retrieval.query" : "retrieval.passage" } : {}),
-        });
+          ...pin,
+        }), { onRetry: status => options.onThrottle?.(status) });
         for (const item of data.data) {
           results[offset + item.index] = { embedding: item.embedding, model };
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(OPENAI_EMBED_CONCURRENCY, batchCount) }, worker));
+    await Promise.all(Array.from({ length: Math.min(concurrency, batchCount) }, worker));
     return results;
   }
 
@@ -2310,6 +2346,7 @@ export class CompositeLLM implements LLM {
   get embedModelName(): string { return this.embedBackend.embedModelName; }
   get generateModelName(): string { return this.generateBackend.generateModelName; }
   get rerankModelName(): string { return this.rerankBackend.rerankModelName; }
+  get embedTuning() { return this.embedBackend.embedTuning; }
 
   embed(text: string, options?: EmbedOptions) { return this.embedBackend.embed(text, options); }
   embedBatch(texts: string[], options?: EmbedOptions) { return this.embedBackend.embedBatch(texts, options); }
