@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Himmel fork
+
+Carried on top of tobi/qmd main (HIMMEL-5952 resync):
+
+- Launcher forwards SIGINT/SIGTERM/SIGHUP to its child and SIGKILLs it after a
+  grace period (tobi/qmd#1029).
+- Rerank is bounded by a timeout with an RRF fallback, covering model and
+  context load (HIMMEL-4216, 4227, 4237); MCP `query` rerank is off by default
+  (HIMMEL-5892).
+- The HTTP daemon requires a bearer token, and refuses to start while an
+  embed-model swap holds the lock (HIMMEL-4324).
+- OpenAI-compatible and Jina remote backends, a local-config trust gate, and a
+  fast remote embed path with a worker pool, retry and resume (HIMMEL-5673,
+  5882).
+- `qmd update` counts pending hashes for the configured embed model
+  (HIMMEL-5887).
+- Plain-text `query` bursts are admission-gated, and typed vec searches are
+  capped and serialized (HIMMEL-5891).
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
