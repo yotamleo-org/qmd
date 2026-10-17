@@ -170,7 +170,7 @@ describe("OpenAiLLM", () => {
     expect(calls[0]!.init.method).toBe("GET");
     expect(await llm.modelExists("openai:general")).toEqual({ name: "openai:general", exists: true });
     await expect(llm.dispose()).resolves.toBeUndefined();
-    expect(llm.tokenize).toBeUndefined();
+    expect((llm as { tokenize?: unknown }).tokenize).toBeUndefined();
   });
 });
 

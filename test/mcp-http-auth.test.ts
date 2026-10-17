@@ -2,9 +2,9 @@ import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync, statSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadOrCreateToken, checkBearer } from "../src/mcp/auth";
-import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
-import { _resetProductionModeForTesting } from "../src/store";
+import { loadOrCreateToken, checkBearer } from "../src/mcp/auth.ts";
+import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server.ts";
+import { _resetProductionModeForTesting } from "../src/store.ts";
 
 describe("http bearer token file", () => {
   test("is generated on first use with mode 0600 and reused afterwards", () => {

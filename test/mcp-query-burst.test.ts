@@ -2,8 +2,8 @@ import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startMcpHttpServer, createExpansionGate, type HttpServerHandle } from "../src/mcp/server";
-import { _resetProductionModeForTesting } from "../src/store";
+import { startMcpHttpServer, createExpansionGate, type HttpServerHandle } from "../src/mcp/server.ts";
+import { _resetProductionModeForTesting } from "../src/store.ts";
 
 // Lets one test replace store.search; every other call reaches the real store.
 const searchStub = vi.hoisted(() => ({ fn: null as null | ((opts: unknown) => Promise<unknown[]>) }));

@@ -51,7 +51,7 @@ function stubLlm(model: string, seen: { isQuery?: boolean }[] = []): LLM {
     },
     embed: async () => ({ embedding: [0.1, 0.2, 0.3], model }),
     dispose: async () => {},
-  } satisfies Partial<LLM> as LLM;
+  } satisfies Partial<LLM> as unknown as LLM;
 }
 
 beforeEach(async () => {
