@@ -53,8 +53,8 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
+import { AdaptiveLimit, LatencyStats, runPool, type LatencySummary } from "./embed-pool.js";
 import {
-  LlamaCpp,
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
@@ -62,8 +62,14 @@ import {
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  isOpenAiModelUri,
+  resolveRerankTimeoutMs,
+  resolveRerankLoadTimeoutMs,
+  RerankTimeoutError,
+  RerankLoadTimeoutError,
   type RerankDocument,
   type ILLMSession,
+  type LLM,
 } from "./llm.js";
 import type {
   NamedCollection,
@@ -157,6 +163,14 @@ export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
 
+/** Embed session TTL: QMD_EMBED_MAX_DURATION_MS (ms; 0 = no limit), else the 30 minute default. */
+export function resolveEmbedMaxDurationMs(): number {
+  const raw = process.env.QMD_EMBED_MAX_DURATION_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_EMBED_MAX_DURATION_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_EMBED_MAX_DURATION_MS;
+}
+
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
 const EMBED_FINGERPRINT_PROBE_DOC = "__qmd_embedding_document_probe__";
@@ -184,10 +198,10 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
 }
 
 /**
- * Get the LlamaCpp instance for a store — prefers the store's own instance,
+ * Get the LLM instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp {
+function getLlm(store: Store): LLM {
   return store.llm ?? getDefaultLlamaCpp();
 }
 
@@ -1585,8 +1599,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM instance for this store (overrides the global singleton) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -2096,6 +2110,8 @@ export type EmbedProgress = {
   /** Active failed chunks still awaiting a successful retry. */
   errors: number;
   failures?: EmbedFailure[];
+  /** Request latencies so far (ms); absent before the first request returns. */
+  latency?: LatencySummary;
 };
 
 export type EmbedResult = {
@@ -2149,6 +2165,8 @@ type ChunkItem = {
   pos: number;
   tokens: number;
   bytes: number;
+  /** This chunk's share of its document's bytes, for byte-based progress. */
+  bytesShare: number;
   expectedTotalChunks: number;
 };
 
@@ -2325,10 +2343,37 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
   }));
 }
 
+const EMBED_ESTIMATE_CHARS_PER_TOKEN = 3; // conservative for prose; the real count comes from the provider
+
+/**
+ * Dry-run for a full reindex (`qmd embed -f`): chunk every active document as
+ * a forced embed would (already-embedded ones included) and estimate the tokens
+ * a remote embedder would bill. Reads only; sends nothing.
+ */
+export function estimateCorpusEmbedTokens(db: Database, collection?: string): { docs: number; chunks: number; chars: number; estimatedTokens: number } {
+  const rows = db.prepare(`
+    SELECT d.hash, c.doc AS body
+    FROM documents d
+    JOIN content c ON d.hash = c.hash
+    WHERE d.active = 1 ${collection ? "AND d.collection = ?" : ""}
+    GROUP BY d.hash
+  `).all(...(collection ? [collection] : [])) as { hash: string; body: string }[];
+  let docs = 0, chunks = 0, chars = 0;
+  for (const row of rows) {
+    if (!row.body.trim()) continue;
+    docs++;
+    for (const chunk of chunkDocument(row.body)) {
+      chunks++;
+      chars += chunk.text.length;
+    }
+  }
+  return { docs, chunks, chars, estimatedTokens: Math.ceil(chars / EMBED_ESTIMATE_CHARS_PER_TOKEN) };
+}
+
 /**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
- * Uses the store's LlamaCpp instance if set, otherwise the global singleton.
+ * Uses the store's LLM instance if set, otherwise the global singleton.
  */
 export async function generateEmbeddings(
   store: Store,
@@ -2341,6 +2386,16 @@ export async function generateEmbeddings(
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
+
+  // Vectors from different models are not comparable. A remote embedder never
+  // silently adds chunks next to another model's vectors; only a full forced
+  // re-embed (which clears them first) may switch the space.
+  if (isOpenAiModelUri(model) && !(options?.force && !options?.collection)) {
+    const other = db.prepare(`SELECT model, COUNT(*) AS n FROM content_vectors WHERE model != ? GROUP BY model ORDER BY n DESC LIMIT 1`).get(model) as { model: string; n: number } | undefined;
+    if (other) {
+      throw new Error(`Stored vectors use ${other.model} (${other.n} chunks) but the configured embedding model is ${model}. Vectors from different models are not comparable: run \`qmd embed -f\` to re-embed the whole corpus in the new space, or point models.embed back at the stored model.`);
+    }
+  }
 
   if (options?.force) {
     clearAllEmbeddings(db, options?.collection);
@@ -2356,7 +2411,7 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
+  // Use store's LLM or global singleton, wrapped in a session
   const embedModelUri = model;
 
   // Create a session manager for this llm instance
@@ -2365,7 +2420,6 @@ export async function generateEmbeddings(
     let bytesProcessed = 0;
     let totalChunks = 0;
     let vectorTableInitialized = false;
-    const BATCH_SIZE = 32;
     const RETRY_AFTER_SUCCESSFUL_CHUNKS = 64;
     const MAX_RETRY_ATTEMPTS = 3;
     const failures = new Map<string, EmbedFailure>();
@@ -2414,10 +2468,19 @@ export async function generateEmbeddings(
         return false;
       }
     };
+    let retrying = false;
     const retryFailedChunks = async (force = false) => {
-      if (!session.isValid || retryQueue.size === 0) return;
+      if (!session.isValid || retryQueue.size === 0 || retrying) return;
       if (!force && successesSinceRetry < RETRY_AFTER_SUCCESSFUL_CHUNKS) return;
       successesSinceRetry = 0;
+      retrying = true;
+      try {
+        await retryPass(force);
+      } finally {
+        retrying = false;
+      }
+    };
+    const retryPass = async (force: boolean) => {
 
       // Normal mode: one retry pass after enough unrelated chunks succeeded.
       // Force mode: we have run out of other chunks for this batch, so keep
@@ -2439,20 +2502,47 @@ export async function generateEmbeddings(
     };
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
-    for (const batchMeta of batches) {
-      // Abort early if session has been invalidated
-      if (!session.isValid) {
-        console.warn(`⚠ Session expired — skipping remaining document batches`);
-        break;
-      }
+    // A remote embedder takes `batchSize` chunks per request and `concurrency`
+    // requests at once; a local one embeds a request of 32 at a time.
+    const tuning = llm.embedTuning;
+    const requestSize = tuning?.batchSize ?? 32;
+    const limit = new AdaptiveLimit(tuning?.concurrency ?? 1);
+    const latency = new LatencyStats();
 
-      const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
-      const batchChunks: ChunkItem[] = [];
-      const expectedChunksByHash = new Map<string, number>();
-      const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+    const reportProgress = () => {
+      options?.onProgress?.({
+        chunksEmbedded,
+        totalChunks,
+        bytesProcessed: Math.min(totalBytes, Math.round(bytesProcessed)),
+        totalBytes,
+        errors: activeErrorCount(),
+        failures: failureList(),
+        latency: latency.summary(),
+      });
+    };
 
-      for (const doc of batchDocs) {
-        if (!doc.body.trim()) continue;
+    // Chunks documents lazily, one at a time, and hands out requests of
+    // `requestSize` chunks. The pool only asks for the next request when a
+    // slot is free, so chunking overlaps the requests already in flight.
+    let batchIndex = 0;
+    let docQueue: EmbeddingDoc[] = [];
+    const buffer: ChunkItem[] = [];
+    const nextRequest = async (): Promise<ChunkItem[] | undefined> => {
+      while (buffer.length < requestSize) {
+        if (docQueue.length === 0) {
+          // A local embedder keeps one request per document batch; a remote
+          // one fills requests across batches so none ever runs short.
+          if (buffer.length > 0 && !tuning) break;
+          if (batchIndex >= batches.length) break;
+          docQueue = getEmbeddingDocsForBatch(db, batches[batchIndex++]!);
+          continue;
+        }
+        const doc = docQueue.shift()!;
+        const docBytes = Math.max(0, doc.bytes);
+        if (!doc.body.trim()) {
+          bytesProcessed += docBytes;
+          continue;
+        }
 
         const title = extractTitle(doc.body, doc.path);
         const chunks = await chunkDocumentByTokensWithLlm(
@@ -2463,9 +2553,11 @@ export async function generateEmbeddings(
           options?.chunkStrategy,
           session.signal,
         );
-
+        const chunkBytes = chunks.map(chunk => encoder.encode(chunk.text).length);
+        const totalChunkBytes = chunkBytes.reduce((sum, n) => sum + n, 0);
+        if (chunks.length === 0) bytesProcessed += docBytes;
         for (let seq = 0; seq < chunks.length; seq++) {
-          batchChunks.push({
+          buffer.push({
             hash: doc.hash,
             path: doc.path,
             title,
@@ -2473,23 +2565,17 @@ export async function generateEmbeddings(
             seq,
             pos: chunks[seq]!.pos,
             tokens: chunks[seq]!.tokens,
-            bytes: encoder.encode(chunks[seq]!.text).length,
+            bytes: chunkBytes[seq]!,
+            bytesShare: totalChunkBytes === 0 ? docBytes / chunks.length : (chunkBytes[seq]! / totalChunkBytes) * docBytes,
             expectedTotalChunks: chunks.length,
           });
         }
-        expectedChunksByHash.set(doc.hash, chunks.length);
+        totalChunks += chunks.length;
       }
-
-      totalChunks += batchChunks.length;
-
-      if (batchChunks.length === 0) {
-        bytesProcessed += batchBytes;
-        options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors: activeErrorCount(), failures: failureList() });
-        continue;
-      }
+      if (buffer.length === 0) return undefined;
 
       if (!vectorTableInitialized) {
-        const firstChunk = batchChunks[0]!;
+        const firstChunk = buffer[0]!;
         const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
         const firstResult = await session.embed(firstText, { model });
         if (!firstResult) {
@@ -2498,102 +2584,91 @@ export async function generateEmbeddings(
         store.ensureVecTable(firstResult.embedding.length);
         vectorTableInitialized = true;
       }
+      return buffer.splice(0, requestSize);
+    };
 
-      const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
-      let batchChunkBytesProcessed = 0;
-
-      for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
-        // Abort early if session has been invalidated (e.g. max duration exceeded)
+    // Each answer is committed chunk by chunk as it lands, so an interrupted
+    // run keeps its work: a document with fewer vectors than chunks is still
+    // pending and the next run embeds only what is missing.
+    const embedRequest = async (group: ChunkItem[]): Promise<void> => {
+      const texts = group.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
+      const started = Date.now();
+      try {
+        const embeddings = await session.embedBatch(texts, tuning ? { model, onThrottle: () => limit.recordThrottle() } : { model });
+        const elapsed = Date.now() - started;
+        latency.record(elapsed);
+        limit.recordSuccess(elapsed);
+        // One IMMEDIATE transaction per request: every chunk writes several
+        // rows across three tables, and a kill mid-request must not leave
+        // them out of step. Failure bookkeeping runs after the commit.
+        const stored: ChunkItem[] = [];
+        const unembedded: ChunkItem[] = [];
+        db.transaction(() => {
+          for (let i = 0; i < group.length; i++) {
+            const chunk = group[i]!;
+            const embedding = embeddings[i];
+            if (embedding) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+              stored.push(chunk);
+            } else {
+              unembedded.push(chunk);
+            }
+          }
+        }).immediate();
+        for (const chunk of stored) {
+          chunksEmbedded++;
+          successesSinceRetry++;
+          clearFailure(chunk);
+        }
+        for (const chunk of unembedded) recordFailure(chunk, "batch embedding returned no vector");
+        for (const chunk of group) bytesProcessed += chunk.bytesShare;
+      } catch (error) {
+        // The request failed (after retries): try the chunks one by one. A
+        // chunk that then succeeds clears its failure, so the visible error
+        // count reflects outstanding failures.
+        const requestReason = reasonFromError(error);
         if (!session.isValid) {
-          const remainingChunks = batchChunks.slice(batchStart);
-          for (const chunk of remainingChunks) recordFailure(chunk, "LLM session expired before embedding chunk");
-          console.warn(`⚠ Session expired — skipping ${remainingChunks.length} remaining chunks`);
-          break;
+          for (const chunk of group) recordFailure(chunk, `batch failed and session expired: ${requestReason}`);
+        } else {
+          for (const chunk of group) await tryEmbedChunk(chunk);
         }
-
-        // Abort early if active error rate is too high (>80% of attempted chunks failed)
-        const processed = chunksEmbedded + activeErrorCount();
-        if (processed >= BATCH_SIZE && activeErrorCount() > processed * 0.8) {
-          const remainingChunks = batchChunks.slice(batchStart);
-          for (const chunk of remainingChunks) recordFailure(chunk, "embedding aborted because error rate was too high");
-          console.warn(`⚠ Error rate too high (${activeErrorCount()}/${processed}) — aborting embedding`);
-          break;
-        }
-
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
-        const chunkBatch = batchChunks.slice(batchStart, batchEnd);
-        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
-
-        try {
-          const embeddings = await session.embedBatch(texts, { model });
-          // One IMMEDIATE transaction per batch: every chunk writes several
-          // rows across three tables, and a kill mid-batch must not leave
-          // them out of step. Failure bookkeeping runs after the commit.
-          const stored: ChunkItem[] = [];
-          const unembedded: ChunkItem[] = [];
-          db.transaction(() => {
-            for (let i = 0; i < chunkBatch.length; i++) {
-              const chunk = chunkBatch[i]!;
-              const embedding = embeddings[i];
-              if (embedding) {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
-                stored.push(chunk);
-              } else {
-                unembedded.push(chunk);
-              }
-            }
-          }).immediate();
-          for (const chunk of stored) {
-            chunksEmbedded++;
-            successesSinceRetry++;
-            clearFailure(chunk);
-          }
-          for (const chunk of unembedded) recordFailure(chunk, "batch embedding returned no vector");
-          batchChunkBytesProcessed += chunkBatch.reduce((sum, chunk) => sum + chunk.bytes, 0);
-          await retryFailedChunks();
-        } catch (error) {
-          // Batch failed — try individual embeddings as fallback. If an
-          // individual retry succeeds, any prior failure for that chunk is
-          // cleared, so the visible error count reflects outstanding failures.
-          const batchReason = reasonFromError(error);
-          if (!session.isValid) {
-            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
-            batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
-          } else {
-            for (const chunk of chunkBatch) {
-              await tryEmbedChunk(chunk);
-              batchChunkBytesProcessed += chunk.bytes;
-              await retryFailedChunks();
-            }
-          }
-        }
-
-        const proportionalBytes = totalBatchChunkBytes === 0
-          ? batchBytes
-          : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
-        options?.onProgress?.({
-          chunksEmbedded,
-          totalChunks,
-          bytesProcessed: bytesProcessed + proportionalBytes,
-          totalBytes,
-          errors: activeErrorCount(),
-          failures: failureList(),
-        });
+        for (const chunk of group) bytesProcessed += chunk.bytesShare;
       }
+      await retryFailedChunks();
+      reportProgress();
+    };
 
-      await retryFailedChunks(true);
-
-      const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
-      if (removedPartialChunks > 0) {
-        chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
+    let stopWarned = false;
+    const shouldStop = (): boolean => {
+      if (!session.isValid) {
+        if (!stopWarned) console.warn(`⚠ Session expired — skipping the remaining chunks`);
+        stopWarned = true;
+        return true;
       }
+      // Abort early if the active error rate is too high (>80% of attempted chunks failed)
+      const processed = chunksEmbedded + activeErrorCount();
+      if (processed >= requestSize && activeErrorCount() > processed * 0.8) {
+        if (!stopWarned) console.warn(`⚠ Error rate too high (${activeErrorCount()}/${processed}) — aborting embedding`);
+        stopWarned = true;
+        return true;
+      }
+      return false;
+    };
 
-      bytesProcessed += batchBytes;
-      options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors: activeErrorCount(), failures: failureList() });
+    await runPool(nextRequest, embedRequest, limit, shouldStop);
+    await retryFailedChunks(true);
+
+    // A document that still has failed chunks is not left half-embedded.
+    const expectedChunksByHash = new Map<string, number>();
+    for (const chunk of retryQueue.values()) expectedChunksByHash.set(chunk.hash, chunk.expectedTotalChunks);
+    const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
+    if (removedPartialChunks > 0) {
+      chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
     }
+    reportProgress();
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }, { maxDuration: options?.maxDurationMs ?? resolveEmbedMaxDurationMs(), name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
@@ -3110,6 +3185,7 @@ export type CacheKeyBody = {
   model?: string;
   chunk?: string;
   file?: string;
+  maxChars?: number;
 };
 
 export function getCacheKey(url: string, body: CacheKeyBody): string {
@@ -3836,9 +3912,12 @@ function stripUnpairedSurrogates(text: string): string {
  *
  * When filepath and chunkStrategy are provided, uses AST-aware break points
  * for supported code files.
+ *
+ * A backend without a tokenizer (remote models) keeps the character-space
+ * chunks as they are, with token counts estimated at the same ratio.
  */
 async function chunkDocumentByTokensWithLlm(
-  llm: LlamaCpp,
+  llm: LLM,
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
@@ -3858,6 +3937,13 @@ async function chunkDocumentByTokensWithLlm(
   // Use AST-aware chunking for the first pass when filepath/strategy provided
   let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
 
+  if (!llm.tokenize || !llm.detokenize) {
+    return charChunks
+      .map(chunk => ({ text: stripUnpairedSurrogates(chunk.text), pos: chunk.pos, tokens: Math.ceil(chunk.text.length / avgCharsPerToken) }))
+      .filter(chunk => chunk.text.length > 0);
+  }
+  const { tokenize, detokenize } = llm;
+
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
   const clampOverlapChars = (value: number, maxChars: number): number => {
@@ -3868,7 +3954,7 @@ async function chunkDocumentByTokensWithLlm(
   const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
     if (signal?.aborted) return;
 
-    const tokens = await llm.tokenize(text);
+    const tokens = await tokenize.call(llm, text);
     if (tokens.length <= maxTokens || text.length <= 1) {
       // Safety net: text.length <= 1 can only legitimately be a single
       // BMP character (a well-formed astral character needs 2 code units),
@@ -3913,7 +3999,7 @@ async function chunkDocumentByTokensWithLlm(
       // Safety net: detokenize() reconstructs text from raw token IDs, and
       // a tokenizer can encode a single astral-plane character across
       // multiple tokens — truncating the token list can land mid-character.
-      const truncatedText = stripUnpairedSurrogates(await llm.detokenize(fallbackTokens));
+      const truncatedText = stripUnpairedSurrogates(await detokenize.call(llm, fallbackTokens));
       if (truncatedText.length === 0) return;
       results.push({
         text: truncatedText,
@@ -4973,7 +5059,7 @@ function nearestVecDocuments(
   }
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, filter?: MetadataFilter): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
@@ -5044,7 +5130,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
@@ -5261,7 +5347,7 @@ function uniqueExpansions(expansions: ExpandedQuery[]): ExpandedQuery[] {
   });
 }
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types. Intent is
   // deliberately absent from both the cache key and the generation call:
   // feeding caller intent to the expansion model contaminates sub-queries
@@ -5286,7 +5372,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   }
 
   const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  // Note: backends use their configured model, the model parameter is ignored
   const results = await llm.expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -5316,7 +5402,15 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+const DEFAULT_RERANK_MAX_DOC_CHARS = 6000;
+
+/** Max characters of one chunk sent to the reranker. Override with QMD_RERANK_MAX_DOC_CHARS. */
+export function resolveRerankMaxDocChars(): number {
+  const raw = Number(process.env.QMD_RERANK_MAX_DOC_CHARS);
+  return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_RERANK_MAX_DOC_CHARS;
+}
+
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const llm = llmOverride ?? getDefaultLlamaCpp();
@@ -5326,6 +5420,10 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
+  // Scores depend on the truncated text actually sent, so the truncation limit
+  // is part of the cache key: changing QMD_RERANK_MAX_DOC_CHARS must not replay
+  // scores computed against a different cut of the chunk.
+  const maxChars = resolveRerankMaxDocChars();
 
   // Check cache for each document
   // Cache key includes chunk text — different queries can select different chunks
@@ -5333,9 +5431,10 @@ export async function rerank(query: string, documents: { file: string; text: str
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text });
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text, maxChars });
     const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: cacheModel, chunk: doc.text });
-    const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
+    // The legacy key predates maxChars, so it can only vouch for chunks that are sent whole.
+    const cached = getCachedResult(db, cacheKey) ?? (doc.text.length <= maxChars ? getCachedResult(db, legacyCacheKey) : null);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
     } else {
@@ -5343,16 +5442,55 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents with the backend
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
+    const sentDocs = uncachedDocs.map(d => d.text.length > maxChars ? { ...d, text: d.text.slice(0, maxChars) } : d);
+    // Cold model/context load can legitimately take a while: it gets its own, larger budget.
+    const loadPromise = llm.prepareRerank?.();
+    if (loadPromise) {
+      const loadTimeoutMs = resolveRerankLoadTimeoutMs();
+      let loadTimer: ReturnType<typeof setTimeout> | undefined;
+      // The loser of the race keeps running; swallow a late rejection.
+      loadPromise.catch(() => {});
+      try {
+        await Promise.race([
+          loadPromise,
+          new Promise<never>((_, reject) => {
+            loadTimer = setTimeout(() => reject(new RerankLoadTimeoutError(loadTimeoutMs)), loadTimeoutMs);
+          }),
+        ]);
+      } catch (err) {
+        // The hung native load cannot be cancelled: refuse all further native work.
+        if (err instanceof RerankLoadTimeoutError) llm.poison?.(err.message);
+        throw err;
+      } finally {
+        clearTimeout(loadTimer);
+      }
+    }
+    const timeoutMs = resolveRerankTimeoutMs();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let rerankResult;
+    try {
+      rerankResult = await Promise.race([
+        llm.rerank(rerankQuery, sentDocs, { model: cacheModel }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new RerankTimeoutError(timeoutMs)), timeoutMs);
+        }),
+      ]);
+    } catch (err) {
+      // The hung native call cannot be cancelled: refuse all further native work.
+      if (err instanceof RerankTimeoutError) llm.poison?.(err.message);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk, maxChars });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(chunk, result.score);
     }
@@ -6212,6 +6350,8 @@ export interface HybridQueryResult {
   docid: string;            // content hash prefix (6 chars)
   metadata: DocumentMetadata; // indexed qmd.metadata for the document
   explain?: HybridQueryExplain;
+  /** Set when the reranker timed out: scores are RRF-only (unreranked). */
+  rerankTimedOut?: true;
 }
 
 /**
@@ -6354,7 +6494,7 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -6492,7 +6632,16 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  let rerankTimedOut = false;
+  let reranked: { file: string; score: number }[];
+  try {
+    reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  } catch (err) {
+    if (!(err instanceof RerankTimeoutError)) throw err;
+    // Fall back to the unreranked hybrid (RRF) order.
+    rerankTimedOut = true;
+    reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
+  }
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -6508,6 +6657,7 @@ export async function hybridQuery(
     if (rrfRank <= 3) rrfWeight = 0.75;
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
+    if (rerankTimedOut) rrfWeight = 1.0;
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
@@ -6543,6 +6693,7 @@ export async function hybridQuery(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      ...(rerankTimedOut ? { rerankTimedOut: true as const } : {}),
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
@@ -6756,7 +6907,7 @@ export async function structuredSearch(
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
@@ -6887,7 +7038,16 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  let rerankTimedOut = false;
+  let reranked: { file: string; score: number }[];
+  try {
+    reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  } catch (err) {
+    if (!(err instanceof RerankTimeoutError)) throw err;
+    // Fall back to the unreranked hybrid (RRF) order.
+    rerankTimedOut = true;
+    reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
+  }
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -6902,6 +7062,7 @@ export async function structuredSearch(
     if (rrfRank <= 3) rrfWeight = 0.75;
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
+    if (rerankTimedOut) rrfWeight = 1.0;
     const rrfScore = 1 / rrfRank;
     const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
@@ -6937,6 +7098,7 @@ export async function structuredSearch(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      ...(rerankTimedOut ? { rerankTimedOut: true as const } : {}),
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);

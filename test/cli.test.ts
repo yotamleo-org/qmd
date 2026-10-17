@@ -1303,6 +1303,38 @@ describe("CLI Update Command", () => {
     expect(stdout).toContain("Updating");
   });
 
+  test("update hint counts pending hashes for the configured embed model, like status", async () => {
+    const customModel = "hf:example/custom-embed/custom.gguf";
+    const env = { QMD_EMBED_MODEL: customModel };
+    const configPath = join(testConfigDir, "index.yml");
+    const configText = readFileSync(configPath, "utf8");
+    // The CLI persists resolved models into the config, which wins over the env var.
+    const hasEmbedKey = /^\s*embed:/m.test(configText);
+    writeFileSync(
+      configPath,
+      hasEmbedKey
+        ? configText.replace(/^(\s*embed:).*$/m, `$1 ${customModel}`)
+        : `${configText.replace(/\n*$/, "\n")}models:\n  embed: ${customModel}\n`,
+    );
+
+    // Every active doc is already embedded under the configured model.
+    // Partition rows are written too: update re-queues any chunk without one.
+    const store = createStore(localDbPath);
+    try {
+      const hashes = store.db.prepare(`SELECT DISTINCT hash FROM documents WHERE active = 1`).all() as { hash: string }[];
+      expect(hashes.length).toBeGreaterThan(0);
+      const now = new Date().toISOString();
+      store.ensureVecTable(3);
+      for (const { hash } of hashes) store.insertEmbedding(hash, 0, 0, new Float32Array([1, 2, 3]), customModel, now);
+    } finally {
+      store.close();
+    }
+
+    const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath, env });
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toContain("unique hashes need vectors");
+  }, 30000);
+
   test("deactivates stale docs when collection has zero matching files", async () => {
     const { dbPath, configDir } = await createIsolatedTestEnv("update-empty");
     const collectionDir = join(testDir, `update-empty-${Date.now()}`);
@@ -2676,6 +2708,9 @@ describe("mcp http daemon", () => {
   let daemonCacheDir: string; // XDG_CACHE_HOME value (the qmd/ subdir is created automatically)
   let daemonDbPath: string;
   let daemonConfigDir: string;
+  let daemonTokenFile: string; // QMD_HTTP_TOKEN_FILE: the bearer token the HTTP server requires
+  const daemonToken = "d".repeat(64);
+  const authHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${daemonToken}` };
 
   // Track spawned PIDs for cleanup
   const spawnedPids: number[] = [];
@@ -2709,6 +2744,7 @@ describe("mcp http daemon", () => {
         INDEX_PATH: daemonDbPath,
         QMD_CONFIG_DIR: daemonConfigDir,
         PWD: fixturesDir,
+        QMD_HTTP_TOKEN_FILE: daemonTokenFile,
         ...options.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -2744,6 +2780,8 @@ describe("mcp http daemon", () => {
     await mkdir(join(daemonCacheDir, "qmd"), { recursive: true });
     await mkdir(daemonConfigDir, { recursive: true });
     await writeFile(join(daemonConfigDir, "index.yml"), "collections: {}\n");
+    daemonTokenFile = join(daemonTestDir, "http-token");
+    await writeFile(daemonTokenFile, daemonToken + "\n", { mode: 0o600 });
   });
 
   afterAll(async () => {
@@ -2836,7 +2874,7 @@ describe("mcp http daemon", () => {
 
       const res = await fetch(`http://localhost:${port}/query`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders,
         body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
       });
       expect(res.status).toBe(200);
@@ -2892,6 +2930,7 @@ describe("mcp http daemon", () => {
         env: {
           INDEX_PATH: "",
           XDG_CACHE_HOME: customCacheDir,
+          QMD_HTTP_TOKEN_FILE: daemonTokenFile,
         },
       },
     );
@@ -2913,7 +2952,7 @@ describe("mcp http daemon", () => {
 
       const res = await fetch(`http://localhost:${port}/query`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders,
         body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
       });
       expect(res.status).toBe(200);

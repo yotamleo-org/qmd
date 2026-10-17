@@ -3,6 +3,7 @@ import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
 import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
+import { swapLockDir, swapLockHolder } from "./swap-lock.js";
 import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
@@ -74,6 +75,7 @@ import {
   type ExpandedQuery,
   type HybridQueryExplain,
   DEFAULT_EMBED_MODEL,
+  estimateCorpusEmbedTokens,
   DEFAULT_EMBED_MAX_BATCH_BYTES,
   DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
   DEFAULT_RERANK_MODEL,
@@ -107,7 +109,7 @@ import { formatMetadataKeySummaries, formatMetadataOverview } from "../metadata-
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, isLlamaPoisoned, killProcessNow, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, OpenAiLLM, CompositeLLM, createLlm, isOpenAiModelUri, resolveOpenAiBaseUrl, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, type LlmConfig } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -173,25 +175,40 @@ function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    let runtime: { activeModels: ReturnType<typeof ensureModelsConfiguredForCli>; config: CollectionConfig } | null = null;
     try {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      // Untrusted project-local custom model URIs must not be loaded; status
-      // still displays the YAML values via resolveModelsForCli (#889).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
-        embedModel: modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
-      });
-      setDefaultLlamaCpp(llm);
-      store.llm = llm;
+      runtime = { activeModels, config };
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
+    if (runtime) {
+      // Untrusted project-local custom model URIs (and the endpoint they
+      // would send documents to) must not be used; status still displays the
+      // YAML values via resolveModelsForCli (#889). Outside the try above: an
+      // `openai:` model without a base URL must fail loudly, never fall back to
+      // a local model that would label its vectors as the remote one.
+      const llm = createLlm(llmConfigForRuntime(runtime.activeModels, runtime.config));
+      setDefaultLlamaCpp(llm);
+      store.llm = llm;
+    }
   }
   return store;
+}
+
+/** Backend config the running process may use: the active models plus the
+ *  endpoint settings, unless the project-local config is untrusted, in which
+ *  case only the built-in/env defaults. */
+function llmConfigForRuntime(activeModels: { embed: string; generate: string; rerank: string }, config: CollectionConfig): LlmConfig {
+  if (!localConfigIsFullyTrusted()) return resolveModels();
+  return {
+    ...activeModels,
+    openaiBaseUrl: config.models?.openai_base_url,
+    openaiApiKey: config.models?.openai_api_key,
+    openaiGenerateParams: config.models?.openai_generate_params,
+  };
 }
 
 function getDb(): Database {
@@ -298,6 +315,20 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
   await new Promise<void>((resolve) => {
     stream.write("", () => resolve());
   });
+}
+
+/**
+ * A rerank that timed out leaves a native call spinning forever, so a normal
+ * teardown (dispose, beforeExit) would hang too. The fallback results are
+ * already printed: flush and kill the process (exit() would block on the stuck
+ * native thread under Node).
+ */
+async function exitIfRerankHung(): Promise<void> {
+  if (!isLlamaPoisoned()) return;
+  process.stderr.write("QMD Warning: rerank timed out; showing unreranked (RRF) results. Raise QMD_RERANK_TIMEOUT_MS (or QMD_RERANK_LOAD_TIMEOUT_MS if the model load hung) or check the GPU. A remote reranker (models.rerank: openai:<id>) avoids the native hang.\n");
+  await flushWritable(process.stdout);
+  await flushWritable(process.stderr);
+  killProcessNow();
 }
 
 /**
@@ -691,6 +722,9 @@ async function showStatus(): Promise<void> {
     console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
     console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
+    if ([activeModels.embed, activeModels.generate, activeModels.rerank].some(isOpenAiModelUri)) {
+      console.log(`  Endpoint:    ${resolveOpenAiBaseUrl(loadConfig().models?.openai_base_url) ?? "(not configured)"}`);
+    }
   }
 
 
@@ -759,6 +793,7 @@ function collectSensitiveSnapshot(): SensitiveSnapshot {
       embed: config.models?.embed,
       rerank: config.models?.rerank,
       generate: config.models?.generate,
+      openai_base_url: config.models?.openai_base_url,
     },
   };
 }
@@ -1031,7 +1066,7 @@ async function updateCollections(): Promise<void> {
   const staleVectors = cleanupOrphanedVectors(db);
 
   // Check if any documents need embedding (show once at end)
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
@@ -2251,7 +2286,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const copiedVectors = copyVectorsToNewCollections(db, collectionName).copied;
 
   // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
@@ -2457,8 +2492,11 @@ async function vectorIndex(
         const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
         const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
         const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
+        const lat = info.latency && info.latency.count > 0
+          ? ` · req p50/p95/max ${info.latency.p50}/${info.latency.p95}/${info.latency.max}ms`
+          : "";
 
-        if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
+        if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput}${lat} · ETA ${eta}${c.reset}   `);
       },
     });
 
@@ -2626,6 +2664,7 @@ type OutputRow = {
   docid?: string;
   metadata?: DocumentMetadata;
   explain?: HybridQueryExplain;
+  rerankTimedOut?: true;
 };
 
 const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
@@ -2753,6 +2792,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         ...(body && { body }),
         ...(snippet && { snippet }),
         ...(opts.explain && row.explain && { explain: row.explain }),
+        ...(row.rerankTimedOut && { rerankTimedOut: true }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -3288,6 +3328,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
     if (results.length === 0) {
       printEmptySearchResults(opts.format);
+      await exitIfRerankHung();
       return;
     }
 
@@ -3309,7 +3350,9 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       docid: r.docid,
       metadata: r.metadata,
       explain: r.explain,
+      rerankTimedOut: r.rerankTimedOut,
     })), displayQuery, { ...opts, limit: results.length });
+    await exitIfRerankHung();
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
@@ -3365,6 +3408,7 @@ function parseCLI() {
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
+      "count-tokens": { type: "boolean" },  // embed dry-run: estimate the tokens of a full reindex, send nothing
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -3907,7 +3951,8 @@ function showHelp(): void {
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
-  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
+  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30; env QMD_EMBED_MAX_DURATION_MS in ms)");
+  console.log("    --count-tokens              - Dry run: estimate the tokens of a full reindex (-f), send nothing");
   console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
   console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
@@ -4113,6 +4158,10 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   addModel("QMD_EMBED_MODEL", "embed", activeModels.embed);
   addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
   addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
+  add("QMD_OPENAI_BASE_URL", "endpoint for openai: models when models.openai_base_url is unset");
+  if (process.env.QMD_OPENAI_API_KEY?.trim()) {
+    overrides.push({ name: "QMD_OPENAI_API_KEY", value: "(set)", consequence: "bearer token for the OpenAI-compatible endpoint; overrides models.openai_api_key" });
+  }
   add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
   add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
   add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
@@ -4206,6 +4255,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
+    if (isOpenAiModelUri(model)) continue; // served remotely: nothing cached
     unique.set(model, [...(unique.get(model) ?? []), role]);
   }
 
@@ -4360,6 +4410,25 @@ function linuxCudaRuntimeDiagnostic(): string | null {
   return `NVIDIA driver libraries are visible, but CUDA user-space libraries are missing from loader paths (${missing.join(", ")})`;
 }
 
+async function runDoctorRemoteChecks(nextSteps: string[]): Promise<void> {
+  const backend = getDefaultLlamaCpp();
+  const llm = backend instanceof CompositeLLM
+    ? [backend.embedBackend, backend.generateBackend, backend.rerankBackend].find(b => b instanceof OpenAiLLM)
+    : backend;
+  if (!(llm instanceof OpenAiLLM)) {
+    doctorCheck("remote endpoint", false, "openai: models configured but the backend is not OpenAiLLM (untrusted project-local config?). Next: `qmd trust`");
+    return;
+  }
+  try {
+    const models = await llm.listModels();
+    doctorCheck("remote endpoint", true, `${llm.endpoint} answers; ${models.length} models listed`);
+  } catch (error) {
+    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+    doctorCheck("remote endpoint", false, `${llm.endpoint}: ${message}. Next: check models.openai_base_url / QMD_OPENAI_BASE_URL and the API key`);
+    nextSteps.push("The OpenAI-compatible endpoint did not answer; embedding and query need it. Check the URL, the key and that the server is running.");
+  }
+}
+
 async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   const mode = configuredGpuModeLabel();
   doctorCheck("device mode", true, mode);
@@ -4377,7 +4446,12 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    const backend = getDefaultLlamaCpp();
+    const llm = backend instanceof CompositeLLM
+      ? [backend.embedBackend, backend.generateBackend, backend.rerankBackend].find(b => b instanceof LlamaCpp)
+      : backend;
+    if (!(llm instanceof LlamaCpp)) throw new Error("default backend is not node-llama-cpp");
+    const device = await llm.getDeviceInfo({ allowBuild: false });
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
@@ -4472,9 +4546,15 @@ async function showDoctor(): Promise<void> {
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
-  checkModelCache(activeModels, nextSteps);
-
-  await runDoctorDeviceChecks(nextSteps);
+  // Remote models have no cache and no device; the endpoint is what can fail.
+  const activeUris = [activeModels.embed, activeModels.generate, activeModels.rerank];
+  if (activeUris.some(isOpenAiModelUri)) {
+    await runDoctorRemoteChecks(nextSteps);
+  }
+  if (!activeUris.every(isOpenAiModelUri)) {
+    checkModelCache(activeModels, nextSteps);
+    await runDoctorDeviceChecks(nextSteps);
+  }
 
   try {
     const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
@@ -4971,6 +5051,12 @@ if (isMain) {
         // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
         const embedCollection = embedValidatedCollections[0];
+        if (cli.values["count-tokens"]) {
+          const est = estimateCorpusEmbedTokens(getStore().db, embedCollection);
+          console.log(`Full reindex (qmd embed -f${embedCollection ? ` -c ${embedCollection}` : ""}): ${est.docs} docs, ${est.chunks} chunks, ${est.chars} chars, ~${est.estimatedTokens} tokens (chars/3 estimate). Nothing was sent.`);
+          closeDb();
+          break;
+        }
         await vectorIndex(resolveModelsForRuntime().embed, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
@@ -4992,8 +5078,13 @@ if (isMain) {
         activeModels.generate,
         activeModels.rerank,
       ];
+      const localModels = models.filter(m => !isOpenAiModelUri(m));
+      if (localModels.length < models.length) {
+        console.log(`Some models are served by ${resolveOpenAiBaseUrl(loadConfig().models?.openai_base_url) ?? "the OpenAI-compatible endpoint"}; nothing to download for those.`);
+      }
+      if (localModels.length === 0) break;
       console.log(`${c.bold}Pulling models${c.reset}`);
-      const results = await pullModels(models, {
+      const results = await pullModels(localModels, {
         refresh,
         cacheDir: DEFAULT_MODEL_CACHE_DIR,
         cli: Boolean(cli.values.progress),
@@ -5060,8 +5151,11 @@ if (isMain) {
           configPath: configExists() ? getConfigPath() : undefined,
         });
       } catch (error) {
+        await exitIfRerankHung();
         exitWithError(error);
       }
+      // A timed-out rerank leaves a native call hung; the rows are already printed.
+      await exitIfRerankHung();
       break;
     }
 
@@ -5101,6 +5195,17 @@ if (isMain) {
         // fallback (resolved in startMcpHttpServer). Use "0.0.0.0" to accept
         // off-host connections, e.g. a container liveness probe.
         const host = cli.values.host ? String(cli.values.host) : undefined;
+
+        // An embed-model swap holds this lock; a server started inside it
+        // embeds queries with the old model against the new vectors.
+        const swapHolder = swapLockHolder();
+        if (swapHolder !== null) {
+          console.error(
+            `Refusing to start: an embed-model swap holds ${swapLockDir()}` +
+            `${swapHolder > 0 ? ` (pid ${swapHolder})` : ""}. Wait for it to finish, then start again.`,
+          );
+          process.exit(1);
+        }
 
         if (cli.values.daemon) {
           // Guard: check if already running (identity-checked — recycled PIDs are stale)
@@ -5157,7 +5262,11 @@ if (isMain) {
         process.on("exit", unlinkOwnPidfile);
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          // Bearer token from a 0600 file (generated on first start). Clients
+          // send `Authorization: Bearer <token>`. QMD_HTTP_AUTH=off disables it.
+          const { loadOrCreateToken } = await import("../mcp/auth.js");
+          const authToken = process.env.QMD_HTTP_AUTH === "off" ? undefined : loadOrCreateToken();
+          await startMcpHttpServer(port, { dbPath: getDbPath(), host, ...(authToken ? { authToken } : {}) });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);

@@ -34,12 +34,20 @@ export interface Collection {
 }
 
 /**
- * Model configuration for embedding, reranking, and generation
+ * Model configuration for embedding, reranking, and generation.
+ *
+ * `hf:` URIs and GGUF paths run locally; `openai:<model id>` URIs are served
+ * by the OpenAI-compatible endpoint in `openai_base_url`. Roles may be mixed
+ * (e.g. a remote `rerank` with local `embed`); changing `embed` to a different
+ * model needs `qmd embed -f`.
  */
 export interface ModelsConfig {
   embed?: string;
   rerank?: string;
   generate?: string;
+  openai_base_url?: string;      // API root, e.g. http://127.0.0.1:8080/v1 (QMD_OPENAI_BASE_URL)
+  openai_api_key?: string;       // bearer token (QMD_OPENAI_API_KEY takes precedence)
+  openai_generate_params?: Record<string, unknown>; // extra fields sent with every chat completion
 }
 
 /**

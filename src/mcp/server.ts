@@ -38,11 +38,25 @@ import {
 import { getConfigPath } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
+import { isLlamaPoisoned, killProcessNow } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
+import { checkBearer } from "./auth.js";
 
 // =============================================================================
 // Types for structured content
 // =============================================================================
+
+/**
+ * A rerank that timed out leaves a native call spinning forever (it ignores
+ * SIGTERM), so the process is unusable. Answer with the fallback results that
+ * are already on their way, then kill the process (exit() would block on the
+ * stuck native thread). A supervisor, if any, restarts the server.
+ */
+function exitIfRerankHung(): void {
+  if (!isLlamaPoisoned()) return;
+  console.error("QMD: rerank (or its model load) timed out; served unreranked results and killing the process (restart the server)");
+  setTimeout(() => killProcessNow(), 1000);
+}
 
 type SearchResultItem = {
   docid: string;  // Short docid (#abc123) for quick reference
@@ -53,6 +67,7 @@ type SearchResultItem = {
   metadata?: DocumentMetadata;  // Indexed qmd.metadata (present when non-empty)
   line: number;   // Absolute line in source markdown
   snippet: string;
+  rerankTimedOut?: true;  // Reranker timed out: score is RRF-only (unreranked)
 };
 
 /**
@@ -128,6 +143,9 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];
   for (const r of results) {
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
+  }
+  if (results.some(r => r.rerankTimedOut)) {
+    lines.push('\nNote: the reranker timed out; results are unreranked (RRF order) and the server is restarting.');
   }
   return lines.join('\n');
 }
@@ -243,6 +261,110 @@ function getInstructions(store: QMDStore): Promise<string> {
   });
   return promise;
 }
+
+/**
+ * Admission gate for plain-text `query` calls. Their query expansion runs on a
+ * local model whose chat session serializes every call (~20 s each), so a burst
+ * queues past the client timeout. The gate admits a bounded number and refuses
+ * the rest at once; typed `searches` never expand and bypass it.
+ */
+export type ExpansionGate = {
+  /** Returns a leave function when admitted, or null when the queue is full. */
+  tryEnter(): (() => void) | null;
+  depth(): number;
+};
+
+export function createExpansionGate(max: number): ExpansionGate {
+  let active = 0;
+  return {
+    tryEnter() {
+      if (active >= max) return null;
+      active += 1;
+      let left = false;
+      return () => {
+        if (left) return;
+        left = true;
+        active -= 1;
+      };
+    },
+    depth: () => active,
+  };
+}
+
+function expansionQueueCap(): number {
+  const n = Number(process.env.QMD_EXPAND_MAX_QUEUED);
+  return Number.isInteger(n) && n >= 1 ? n : 3;
+}
+
+// One gate per process: the HTTP transport builds a server per request.
+const expansionGate = createExpansionGate(expansionQueueCap());
+
+/**
+ * Serial admission queue for typed `query` searches that embed (vec, hyde);
+ * plain-text calls are capped by the expansion gate. The embedder and chat model answer one call at a time (~30 s each), so
+ * a burst of N waits N x 30 s past the client timeout. At most `max` calls are
+ * held (one running, the rest waiting); a call past that is refused at once. A
+ * waiting call whose client cancelled leaves the queue and never starts.
+ */
+export type QueryQueueTicket = { ok: true; release: () => void } | { ok: false; reason: "busy" | "cancelled" };
+export type QueryQueue = {
+  acquire(signal?: AbortSignal): Promise<QueryQueueTicket>;
+  /** Calls held: the running one plus those waiting. */
+  depth(): number;
+};
+
+export function createQueryQueue(max: number): QueryQueue {
+  let held = 0;
+  let running = false;
+  const waiting: Array<() => void> = [];
+  const ticket = (): QueryQueueTicket => {
+    running = true;
+    let done = false;
+    return {
+      ok: true,
+      release: () => {
+        if (done) return;
+        done = true;
+        held -= 1;
+        running = false;
+        const next = waiting.shift();
+        if (next) next();
+      },
+    };
+  };
+  return {
+    acquire(signal) {
+      if (signal?.aborted) return Promise.resolve({ ok: false, reason: "cancelled" });
+      if (held >= max) return Promise.resolve({ ok: false, reason: "busy" });
+      held += 1;
+      if (!running) return Promise.resolve(ticket());
+      return new Promise<QueryQueueTicket>((resolve) => {
+        const onAbort = () => {
+          const i = waiting.indexOf(start);
+          if (i < 0) return;
+          waiting.splice(i, 1);
+          held -= 1;
+          resolve({ ok: false, reason: "cancelled" });
+        };
+        const start = () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve(ticket());
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        waiting.push(start);
+      });
+    },
+    depth: () => held,
+  };
+}
+
+function queryQueueCap(): number {
+  const n = Number(process.env.QMD_QUERY_MAX_QUEUED);
+  return Number.isInteger(n) && n >= 1 ? n : 3;
+}
+
+// One queue per process, like the expansion gate.
+const queryQueue = createQueryQueue(queryQueueCap());
 
 /**
  * Create an MCP server with all QMD tools, resources, and prompts registered.
@@ -363,7 +485,7 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 
 | Goal | Approach |
 |------|----------|
-| General search (recommended) | Pass \`query\` — auto-expanded into typed variants, fused, reranked |
+| General search (recommended) | Pass \`query\` — auto-expanded into typed variants and fused (~20 s; busy answer when queued); add \`rerank: true\` to rerank |
 | Know exact term/name | \`lex\` only |
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
@@ -397,7 +519,7 @@ Intent-aware lex (C++ performance, not sports):
       inputSchema: z.object({
         query: z.string().optional().describe(
           "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
-          "RRF and reranked. Recommended default for most searches. Mutually exclusive with 'searches'."
+          "RRF (reranked only with rerank: true). Query expansion is slow (~20 s) and queued; when the server answers busy, use 'searches'. Mutually exclusive with 'searches'."
         ),
         searches: z.array(subSearchSchema).max(10).optional().describe(
           "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
@@ -423,12 +545,12 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
-        rerank: z.boolean().optional().default(true).describe(
-          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+        rerank: z.boolean().optional().default(false).describe(
+          "Rerank results with the reranker (default: false; adds ~20 s and a billed remote call). Pass true to opt in."
         ),
       }),
     },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }) => {
+    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }, extra) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -460,16 +582,54 @@ Intent-aware lex (C++ performance, not sports):
         ? { query }
         : { queries: (searches ?? []).map(s => ({ type: s.type, query: s.query })) };
 
-      const results = await store.search({
-        ...searchOptions,
-        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-        filter: filterValidation.filter,
-        limit,
-        minScore,
-        candidateLimit,
-        rerank,
-        intent,
-      });
+      // Only a plain `query` expands; typed `searches` skip the serialized model.
+      let leave: (() => void) | null = () => {};
+      if (query) {
+        leave = expansionGate.tryEnter();
+        if (!leave) {
+          return {
+            content: [{ type: "text" as const, text: `Busy: ${expansionGate.depth()} plain-text queries are already queued for query expansion (~20 s each). Retry with typed 'searches' (lex + vec), which are not queued.` }],
+            isError: true,
+          };
+        }
+      }
+
+      // Typed searches that embed (vec, hyde) wait their turn on the one model;
+      // lex-only searches never touch it, and plain `query` has its own gate above.
+      let releaseQueue: () => void = () => {};
+      if (!query && searches?.some(s => s.type !== "lex")) {
+        const turn = await queryQueue.acquire(extra?.mcpReq?.signal);
+        if (!turn.ok) {
+          leave();
+          return {
+            content: [{
+              type: "text" as const,
+              text: turn.reason === "busy"
+                ? `Busy: ${queryQueue.depth()} queries are already queued (~30 s each). Retry shortly, or use a lex-only search.`
+                : "Cancelled before it started.",
+            }],
+            isError: true,
+          };
+        }
+        releaseQueue = turn.release;
+      }
+
+      let results;
+      try {
+        results = await store.search({
+          ...searchOptions,
+          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+          filter: filterValidation.filter,
+          limit,
+          minScore,
+          candidateLimit,
+          rerank,
+          intent,
+        });
+      } finally {
+        leave();
+        releaseQueue();
+      }
 
       // Use the plain query, or the first lex/vec sub-query, for snippet extraction
       const primaryQuery = query
@@ -477,6 +637,8 @@ Intent-aware lex (C++ performance, not sports):
         || searches?.find(s => s.type === 'vec')?.query
         || searches?.[0]?.query
         || "";
+
+      exitIfRerankHung();
 
       const filtered: SearchResultItem[] = results.map(r => {
         const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
@@ -487,6 +649,7 @@ Intent-aware lex (C++ performance, not sports):
           score: Math.round(r.score * 100) / 100,
           context: r.context,
           ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
+          ...(r.rerankTimedOut ? { rerankTimedOut: true as const } : {}),
           line,
           snippet: addLineNumbers(snippet, line),
         };
@@ -1061,7 +1224,7 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[] } & McpStartupOptions) = {},
+  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[]; authToken?: string } & McpStartupOptions) = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
@@ -1179,6 +1342,16 @@ export async function startMcpHttpServer(
         return;
       }
 
+      // Bearer token (when configured): everything except the /health liveness
+      // probe. The token is never logged.
+      if (options.authToken && !(pathname === "/health" && nodeReq.method === "GET")
+          && !checkBearer(nodeReq.headers.authorization, options.authToken)) {
+        nodeRes.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": "Bearer" });
+        nodeRes.end(JSON.stringify({ error: "Unauthorized" }));
+        log(`${ts()} ${nodeReq.method} ${pathname} 401`);
+        return;
+      }
+
       if (pathname === "/health" && nodeReq.method === "GET") {
         const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
@@ -1265,6 +1438,7 @@ export async function startMcpHttpServer(
             score: Math.round(r.score * 100) / 100,
             context: r.context,
             ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
+            ...(r.rerankTimedOut ? { rerankTimedOut: true as const } : {}),
             line,
             snippet: addLineNumbers(snippet, line),
           };
@@ -1272,6 +1446,7 @@ export async function startMcpHttpServer(
 
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ results: formatted }));
+        exitIfRerankHung();
         log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }

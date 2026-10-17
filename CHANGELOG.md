@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Himmel fork
+
+Carried on top of tobi/qmd main (HIMMEL-5952 resync):
+
+- Launcher forwards SIGINT/SIGTERM/SIGHUP to its child and SIGKILLs it after a
+  grace period (tobi/qmd#1029).
+- Rerank is bounded by a timeout with an RRF fallback, covering model and
+  context load (HIMMEL-4216, 4227, 4237); MCP `query` rerank is off by default
+  (HIMMEL-5892).
+- The HTTP daemon requires a bearer token, and refuses to start while an
+  embed-model swap holds the lock (HIMMEL-4324).
+- OpenAI-compatible and Jina remote backends, a local-config trust gate, and a
+  fast remote embed path with a worker pool, retry and resume (HIMMEL-5673,
+  5882).
+- `qmd update` counts pending hashes for the configured embed model
+  (HIMMEL-5887).
+- Plain-text `query` bursts are admission-gated, and typed vec searches are
+  capped and serialized (HIMMEL-5891).
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
@@ -13,6 +32,23 @@
 
 ### Added
 
+- Per-role remote models and Jina. A mix such as a remote `rerank` with local
+  `embed`/`generate` is now allowed (previously refused), so existing vectors
+  stay valid. `JINA_API_KEY`/`JINA_API` authenticate `jina.ai` endpoints only;
+  Jina embeddings send the `retrieval.passage`/`retrieval.query` task. A remote
+  embed model refuses to add vectors beside another model's (`qmd embed -f`).
+  `qmd embed --count-tokens` is a dry run for a full reindex;
+  `QMD_EMBED_MAX_DURATION_MS` sets the embed session cap.
+- OpenAI-compatible remote models. `models.embed`/`.rerank`/`.generate` accept
+  `openai:<model id>` URIs served by `models.openai_base_url` (or
+  `QMD_OPENAI_BASE_URL`) with an optional `openai_api_key` /
+  `QMD_OPENAI_API_KEY`, for machines without a usable GPU or with a model
+  server already running. Embeddings (`/embeddings`, batched), reranking
+  (`/rerank`), generation and query expansion (`/chat/completions`) all go to
+  the endpoint; `qmd pull` becomes a no-op and `qmd doctor` probes the
+  endpoint instead of the GPU. `hf:` URIs keep running locally and remain the
+  default. The store, sessions and SDK are now typed against the `LLM`
+  interface, so a backend without a tokenizer chunks by character estimate.
 - Added Oxlint lint fence.
 - Document metadata and metadata filtering. Markdown documents can opt into typed metadata through a namespaced frontmatter block (`qmd.metadata` with strings, numbers, booleans, or flat homogeneous arrays), and every search surface — CLI `search`/`vsearch`/`query` via `--filter <json>`, the SDK's `filter` option on `search()`/`searchLex()`/`searchVector()`, the MCP `query` tool, and HTTP `POST /query` and `/search` — accepts one shared recursive filter AST discriminated by `operator`: `and`/`or`/`not` logical groups, `eq`/`ne`/`gt`/`gte`/`lt`/`lte` comparisons, `in`/`nin`/`all` membership, `contains`/`prefix`/`suffix` text matching, `type` for the stored type of a key's values, and `exists` presence, with an optional `caseInsensitive` flag on any condition whose value is a string (ASCII folding). Every returned result satisfies the filter (applied before RRF fusion and reranking); like collection filtering, highly selective filters remain best-effort for top-K completeness. Frontmatter stays ordinary searchable content — no chunking, embedding, snippet, or line-number changes — and documents without `qmd.metadata` behave exactly as before. JSON/SDK/MCP/HTTP results now include each document's indexed metadata, and `qmd status` reports how many documents still need metadata extraction (a normal `qmd update` backfills existing indexes).
 - Metadata discovery. Filtering is only useful when the caller knows what to filter on, so every surface now reports the metadata keys, types, and value counts already in the index — read from the existing metadata tables, with no re-indexing. The CLI adds `qmd collection metadata [name...]` with `--filter <json>` to count only documents matching a filter (same AST as search) and `--match <json>` to select which metadata entries are reported (the same AST evaluated per entry, where a condition's `field` is the entry's `key` or `value`, so one grammar covers a single key, a family of keys, reverse lookup of a value, typed thresholds, and any `and`/`or`/`not` composition), plus `--key-limit`/`--key-offset`/`--all-keys` and `--value-limit`/`--value-offset`/`--all-values` to page both windows, and `--sort count|value` and `--min-count <n>` to order and trim values. Every windowed list reports its exact remainder, counts are documents rather than values, numbers report min/median/max, keys whose documents disagree on type are split per type with their own counts, and with `--filter` every coverage count is measured against the documents the filter admits. `qmd collection list` names each collection's top keys, `qmd collection show` details them with a value preview, and `qmd status` summarizes coverage. The SDK adds `listMetadata(options)` (the same options, spelled `keyLimit`, `valueLimit`, and so on, with `MetadataOptionError` for a value outside its domain and `MetadataBindingBudgetError` for a filter and match that together bind too many SQL parameters), the MCP server adds a `metadata` tool and lists each collection's most covered keys in `status`, and the HTTP server adds `POST /metadata`. `MetadataFilter` and `MetadataMatch` are both `MetadataPredicate<Condition>`, one recursive grammar over the conditions a document or a metadata entry admits.

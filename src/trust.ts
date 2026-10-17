@@ -8,7 +8,8 @@
  * - `update:` — a shell command run by `qmd update` (#886)
  * - `collections.*.path` — any directory the process can read (#889)
  * - `models.embed` / `models.rerank` / `models.generate` — any `hf:` repo or
- *   local GGUF path (#889)
+ *   local GGUF path (#889), or an `openai:` model whose
+ *   `models.openai_base_url` receives every indexed document
  *
  * Global `~/.config/qmd` is never gated. In-project collection paths and the
  * built-in default model URIs are also allowed without approval: those are
@@ -21,7 +22,7 @@
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
-import { getConfigDir } from "./collections.js";
+import { getConfigDir, type CollectionConfig } from "./collections.js";
 import { qmdHomedir } from "./paths.js";
 
 /** A collection's pre-update hook, as it will be executed. */
@@ -35,12 +36,13 @@ export type CollectionPath = {
   path: string;
 };
 
-export type ModelSlot = "embed" | "rerank" | "generate";
+export type ModelSlot = "embed" | "rerank" | "generate" | "openai_base_url";
 
 export type ModelsSnapshot = {
   embed?: string;
   rerank?: string;
   generate?: string;
+  openai_base_url?: string;
 };
 
 export type SensitiveSnapshot = {
@@ -55,7 +57,7 @@ export type GatedItems = {
   models: Array<{ slot: ModelSlot; uri: string }>;
 };
 
-export type BuiltinModels = Required<ModelsSnapshot>;
+export type BuiltinModels = Required<Omit<ModelsSnapshot, "openai_base_url">>;
 
 export type TrustRecord = {
   /** Digest of the gated set that was approved. */
@@ -143,6 +145,9 @@ export function gatedModels(
     if (uri === builtins[slot]) continue;
     out.push({ slot, uri });
   }
+  // Part of the digest so that swapping the endpoint under approved
+  // `openai:` models re-arms the gate: it decides where documents are sent.
+  if (models.openai_base_url) out.push({ slot: "openai_base_url", uri: models.openai_base_url });
   return out;
 }
 
@@ -266,6 +271,39 @@ export type LocalConfigGateDecision = HookGateDecision;
 function isTruthyEnv(value: string | undefined): boolean {
   if (!value) return false;
   return !["0", "false", "off", "no", "none"].includes(value.trim().toLowerCase());
+}
+
+/**
+ * Whether a config's remote-capable fields (`models.*`, `openai_*`) may be used
+ * by a non-interactive caller such as `createStore` (SDK, MCP). Mirrors the CLI
+ * gate: a project-local config is trusted when the process opted in, when it
+ * gates nothing, or when its current digest was approved with `qmd trust`.
+ * Global configs are always usable. Never prompts.
+ */
+export function localConfigModelsUsable(
+  configPath: string,
+  config: CollectionConfig,
+  builtins: BuiltinModels,
+): boolean {
+  if (!isLocalConfigPath(configPath)) return true;
+  if (isLocalConfigTrustOptedIn()) return true;
+  const snapshot: SensitiveSnapshot = {
+    hooks: Object.entries(config.collections ?? {})
+      .filter(([, col]) => !!col.update)
+      .map(([name, col]) => ({ collection: name, command: col.update! })),
+    paths: Object.entries(config.collections ?? {}).map(([name, col]) => ({
+      collection: name,
+      path: col.path,
+    })),
+    models: {
+      embed: config.models?.embed,
+      rerank: config.models?.rerank,
+      generate: config.models?.generate,
+      openai_base_url: config.models?.openai_base_url,
+    },
+  };
+  if (!hasGatedItems(gatedItems(configPath, snapshot, builtins))) return true;
+  return isTrusted(configPath, sensitiveDigest(snapshot, configPath, builtins));
 }
 
 /** True when the process has opted in to trusting project-local config unattended. */
