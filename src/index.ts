@@ -25,6 +25,9 @@ import {
   extractSnippet,
   addLineNumbers,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  DEFAULT_EMBED_MODEL,
+  DEFAULT_RERANK_MODEL,
+  DEFAULT_QUERY_MODEL,
   reindexCollection,
   EmbedLockBusyError,
   generateEmbeddings,
@@ -77,6 +80,7 @@ import {
 import {
   LlamaCpp,
   withLLMSessionForLlm,
+  createLlm,
 } from "./llm.js";
 export { RemoteEmbedder } from "./remote-embed.js";
 export type { RemoteEmbedOptions } from "./remote-embed.js";
@@ -86,6 +90,7 @@ export { createCommandProcessor } from "./processors.js";
 export type { DocumentProcessor, ProcessorInput, ProcessorDocument, CommandProcessorSpec } from "./processors.js";
 import { snapshotProcessor, type DocumentProcessor } from "./processors.js";
 import { requireProcessor, hasProcessorMode } from "./processor-store.js";
+import { localConfigModelsUsable } from "./trust.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -692,14 +697,28 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // an invalid selection fails without creating a database.
   const configuredConfig: CollectionConfig | undefined = configScope?.load();
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    embedModel: configuredConfig?.models?.embed,
-    embedOptions: configuredConfig?.models?.embedOptions,
-    generateModel: configuredConfig?.models?.generate,
-    rerankModel: configuredConfig?.models?.rerank,
-    rerankOptions: configuredConfig?.models?.rerankOptions,
+  // Create a per-store LLM instance. LlamaCpp lazy-loads models on first use
+  // and auto-unloads after 5 min inactivity to free VRAM; OpenAiLLM holds nothing.
+  // An untrusted project-local config (arrives with a git clone) must not choose
+  // models or an endpoint: the SDK and MCP paths apply the CLI's trust gate here,
+  // non-interactively, and fall back to the built-in/env defaults.
+  const models = configuredConfig && options.configPath
+    && !localConfigModelsUsable(options.configPath, configuredConfig, {
+      embed: DEFAULT_EMBED_MODEL,
+      rerank: DEFAULT_RERANK_MODEL,
+      generate: DEFAULT_QUERY_MODEL,
+    })
+    ? undefined
+    : configuredConfig?.models;
+  const llm = createLlm({
+    embed: models?.embed,
+    embedOptions: models?.embedOptions,
+    generate: models?.generate,
+    rerank: models?.rerank,
+    rerankOptions: models?.rerankOptions,
+    openaiBaseUrl: models?.openai_base_url,
+    openaiApiKey: models?.openai_api_key,
+    openaiGenerateParams: models?.openai_generate_params,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });

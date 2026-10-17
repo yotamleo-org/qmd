@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### Himmel fork
+
+Carried on top of tobi/qmd v2.9.0 (HIMMEL-10446 resync; earlier HIMMEL-5952):
+
+- Launcher forwards SIGINT/SIGTERM/SIGHUP to its child and SIGKILLs it after a
+  grace period (tobi/qmd#1029).
+- Rerank is bounded by a timeout with an RRF fallback, covering model and
+  context load (HIMMEL-4216, 4227, 4237); MCP `query` rerank is off by default
+  (HIMMEL-5892).
+- The HTTP daemon requires a bearer token, and refuses to start while an
+  embed-model swap holds the lock (HIMMEL-4324).
+- OpenAI-compatible and Jina remote backends, a local-config trust gate, and a
+  fast remote embed path with a worker pool, retry and resume (HIMMEL-5673,
+  5882).
+- `qmd update` counts pending hashes for the configured embed model
+  (HIMMEL-5887).
+- Plain-text `query` bursts are admission-gated, and typed vec searches are
+  capped and serialized (HIMMEL-5891).
+
+### Added
+
+- Per-role remote models and Jina. A mix such as a remote `rerank` with local
+  `embed`/`generate` is now allowed (previously refused), so existing vectors
+  stay valid. `JINA_API_KEY`/`JINA_API` authenticate `jina.ai` endpoints only;
+  Jina embeddings send the `retrieval.passage`/`retrieval.query` task. A remote
+  embed model refuses to add vectors beside another model's (`qmd embed -f`).
+  `qmd embed --count-tokens` is a dry run for a full reindex;
+  `QMD_EMBED_MAX_DURATION_MS` sets the embed session cap.
+- OpenAI-compatible remote models. `models.embed`/`.rerank`/`.generate` accept
+  `openai:<model id>` URIs served by `models.openai_base_url` (or
+  `QMD_OPENAI_BASE_URL`) with an optional `openai_api_key` /
+  `QMD_OPENAI_API_KEY`, for machines without a usable GPU or with a model
+  server already running. Embeddings (`/embeddings`, batched), reranking
+  (`/rerank`), generation and query expansion (`/chat/completions`) all go to
+  the endpoint; `qmd pull` becomes a no-op and `qmd doctor` probes the
+  endpoint instead of the GPU. `hf:` URIs keep running locally and remain the
+  default. The store, sessions and SDK are now typed against the `LLM`
+  interface, so a backend without a tokenizer chunks by character estimate.
+
 ## [2.9.0] - 2026-11-17
 
 QMD adds document processors, metadata filtering, and remote model support.

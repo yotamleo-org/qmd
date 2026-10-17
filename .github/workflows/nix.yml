@@ -2,9 +2,9 @@ name: Nix
 
 on:
   push:
-    branches: [main]
+    branches: [main, "himmel/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "himmel/**"]
 
 jobs:
   build-flake:

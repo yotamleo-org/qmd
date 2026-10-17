@@ -1,7 +1,10 @@
 /**
- * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
+ * llm.ts - LLM abstraction layer for QMD
  *
- * Provides embeddings, text generation, and reranking using local GGUF models.
+ * Provides embeddings, text generation, and reranking. Two backends implement
+ * the `LLM` interface: `LlamaCpp` runs local GGUF models through
+ * node-llama-cpp (the default), and `OpenAiLLM` calls an OpenAI-compatible
+ * HTTP server. `createLlm` picks one from the configured model URIs.
  */
 
 import type {
@@ -80,6 +83,7 @@ import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, rea
 import { createRequire } from "node:module";
 import { RemoteEmbedder, isRemoteEmbedModel, type RemoteEmbedOptions } from "./remote-embed.js";
 import { JevReranker, isJevModel, type JevRerankOptions } from "./jev.js";
+import { HttpStatusError, parseRetryAfterMs, readPositiveIntEnv, withRetry } from "./embed-pool.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -94,9 +98,20 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
 }
 
 /**
+ * Detect a model served by an OpenAI-compatible endpoint (`openai:<model id>`).
+ * Mirrors the `hf:` convention so a model URI says which backend owns it, and
+ * vectors stored under it can never be mistaken for a local model's.
+ */
+export function isOpenAiModelUri(modelUri: string): boolean {
+  return modelUri.startsWith(OPENAI_MODEL_PREFIX);
+}
+
+/**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
+ * Remote (`openai:`) models get the raw text: their prompt format, if any, is
+ * the server's business and the gemma prefix would only hurt.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
@@ -104,6 +119,7 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
+  if (isOpenAiModelUri(uri)) return query;
   return `task: search result | query: ${query}`;
 }
 
@@ -115,8 +131,8 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
   if (uri.startsWith("remote-openai:") || isRemoteEmbedModel(uri)) return title ? `${title}\n${text}` : text;
-  if (isQwen3EmbeddingModel(uri)) {
-    // Qwen3-Embedding: documents are raw text, no task prefix
+  if (isQwen3EmbeddingModel(uri) || isOpenAiModelUri(uri)) {
+    // Qwen3-Embedding and remote models: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
@@ -212,6 +228,8 @@ export type EmbedOptions = {
   model?: string;
   isQuery?: boolean;
   title?: string;
+  /** Called with the status of each request the remote backend retried (429/5xx). */
+  onThrottle?: (status: number) => void;
 };
 
 /**
@@ -297,6 +315,9 @@ const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query
 export const LFM2_GENERATE_MODEL = "hf:LiquidAI/LFM2-1.2B-GGUF/LFM2-1.2B-Q4_K_M.gguf";
 export const LFM2_INSTRUCT_MODEL = "hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q4_K_M.gguf";
 
+/** Prefix of a model id served by an OpenAI-compatible endpoint, e.g. `openai:text-embedding-3-small`. */
+export const OPENAI_MODEL_PREFIX = "openai:";
+
 export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
@@ -321,6 +342,62 @@ export function resolveRerankModel(config?: ModelResolutionConfig): string {
   const model = config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
   if (typeof model !== "string") throw new Error("Rerank model must be a single URI string");
   return model;
+}
+
+const DEFAULT_RERANK_TIMEOUT_MS = 60_000;
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** Budget for the rerank scoring itself (model load excluded). Override with QMD_RERANK_TIMEOUT_MS. */
+export function resolveRerankTimeoutMs(): number {
+  const raw = Number(process.env.QMD_RERANK_TIMEOUT_MS);
+  // setTimeout clamps anything above 2^31-1 ms to 1 ms, which would time out instantly.
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_TIMEOUT_MS;
+}
+
+const DEFAULT_RERANK_LOAD_TIMEOUT_MS = 600_000;
+
+/** Budget for the rerank model/context load (a cold load can take minutes). Override with QMD_RERANK_LOAD_TIMEOUT_MS. */
+export function resolveRerankLoadTimeoutMs(): number {
+  const raw = Number(process.env.QMD_RERANK_LOAD_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_LOAD_TIMEOUT_MS;
+}
+
+/** Thrown when a native rerank call does not settle within its budget. */
+export class RerankTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`Rerank did not finish within ${timeoutMs}ms`);
+    this.name = "RerankTimeoutError";
+  }
+}
+
+/** Thrown when the rerank model/context load does not settle within its budget. A RerankTimeoutError, so the RRF fallback and exit paths apply. */
+export class RerankLoadTimeoutError extends RerankTimeoutError {
+  constructor(timeoutMs: number) {
+    super(timeoutMs);
+    this.message = `Rerank model load did not finish within ${timeoutMs}ms`;
+    this.name = "RerankLoadTimeoutError";
+  }
+}
+
+// Set once any LlamaCpp instance is poisoned. A hung native call (e.g. a GPU
+// fault leaving ggml-vulkan waiting on a fence forever) cannot be cancelled and
+// ignores SIGTERM, so callers use this to know they must exit the process.
+let llamaPoisoned = false;
+export function isLlamaPoisoned(): boolean {
+  return llamaPoisoned;
+}
+/**
+ * End the process without running exit(): under Node, exit() joins the libuv
+ * threadpool, which blocks forever on the stuck native worker. SIGKILL (exit
+ * code 137) is the only way out once a native call has hung.
+ */
+export function killProcessNow(): never {
+  process.kill(process.pid, "SIGKILL");
+  // Not reached; SIGKILL cannot be handled.
+  return process.exit(137);
+}
+export function resetLlamaPoisonedForTests(): void {
+  llamaPoisoned = false;
 }
 
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
@@ -608,10 +685,25 @@ export async function pullModels(
  * Abstract LLM interface - implement this for different backends
  */
 export interface LLM {
+  /** Model URIs this backend answers with (`hf:…` or `openai:…`). */
+  readonly embedModelName: string;
+  readonly generateModelName: string;
+  readonly rerankModelName: string;
+  /**
+   * Request size and requests in flight a remote embedder takes. Absent on a
+   * local backend, which embeds one request at a time.
+   */
+  readonly embedTuning?: { batchSize: number; concurrency: number };
+
   /**
    * Get embeddings for text
    */
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Get embeddings for several texts in one call
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -636,9 +728,61 @@ export interface LLM {
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
 
   /**
+   * Tokenize/detokenize with the embedding model's tokenizer. Optional: a
+   * remote backend has no tokenizer, and chunking falls back to character
+   * estimates when these are absent.
+   */
+  tokenize?(text: string): Promise<readonly LlamaToken[]>;
+  detokenize?(tokens: readonly LlamaToken[]): Promise<string>;
+
+  /** Local-only: load the rerank model ahead of the timed rerank call. A remote backend has nothing to load. */
+  prepareRerank?(): Promise<void>;
+  /** Local-only: refuse all further native work after a hung native call. A remote backend has no native state. */
+  poison?(reason: string): void;
+
+  /**
    * Dispose of resources
    */
   dispose(): Promise<void>;
+}
+
+/**
+ * Parse the `lex: …` / `vec: …` / `hyde: …` lines a query-expansion model
+ * emits into Queryables. Shared by both backends so they agree on what counts
+ * as a usable expansion: a line must repeat at least one term of the query,
+ * otherwise the model wandered off and the sub-query would match anything.
+ */
+export function parseExpansionLines(output: string, query: string, includeLexical: boolean): Queryable[] {
+  const lines = output.trim().split("\n");
+  const queryLower = query.toLowerCase();
+  const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+
+  const hasQueryTerm = (text: string): boolean => {
+    const lower = text.toLowerCase();
+    if (queryTerms.length === 0) return true;
+    return queryTerms.some(term => lower.includes(term));
+  };
+
+  const queryables: Queryable[] = lines.map(line => {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) return null;
+    const type = line.slice(0, colonIdx).trim();
+    if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
+    const text = line.slice(colonIdx + 1).trim();
+    if (!hasQueryTerm(text)) return null;
+    return { type: type as QueryType, text };
+  }).filter((q): q is Queryable => q !== null);
+
+  // Filter out lex entries if not requested
+  const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+  if (filtered.length > 0) return filtered;
+
+  const fallback: Queryable[] = [
+    { type: 'hyde', text: `Information about ${query}` },
+    { type: 'lex', text: query },
+    { type: 'vec', text: query },
+  ];
+  return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
 }
 
 // =============================================================================
@@ -1040,7 +1184,7 @@ class LlmResourceLifecycle {
  */
 const llmLifecycles = new WeakMap<object, LlmResourceLifecycle>();
 
-function lifecycleFor(llm: LlamaCpp): LlmResourceLifecycle {
+function lifecycleFor(llm: LLM): LlmResourceLifecycle {
   let lifecycle = llmLifecycles.get(llm);
   if (!lifecycle) {
     lifecycle = new LlmResourceLifecycle();
@@ -1089,6 +1233,25 @@ export class LlamaCpp implements LLM {
    * inactivity timer, so all of them agree on one lifecycle.
    */
   private readonly lifecycle: LlmResourceLifecycle;
+
+  // Set after a native call hung; every later native call is refused.
+  private poisonReason: string | null = null;
+
+  get poisoned(): boolean {
+    return this.poisonReason !== null;
+  }
+
+  /** Refuse all further native calls on this instance. */
+  poison(reason: string): void {
+    this.poisonReason ??= reason;
+    llamaPoisoned = true;
+  }
+
+  private assertNotPoisoned(): void {
+    if (this.poisonReason !== null) {
+      throw new Error(`LlamaCpp instance is poisoned (${this.poisonReason}); restart the process`);
+    }
+  }
 
   constructor(config: LlamaCppConfig = {}) {
     // STRUCTURAL INVARIANT: the launcher (bin/qmd) and the Nix flake wrapper
@@ -1179,6 +1342,7 @@ export class LlamaCpp implements LLM {
    */
   private handleInactivityTimeout(): void {
     this.inactivityTimer = null;
+    if (this.poisonReason !== null) return;
     if (this.startIdleUnload()) return;
     // Work is still leased (session or in-flight operation): the resources
     // were not idle, so look again after another full idle window.
@@ -1205,6 +1369,9 @@ export class LlamaCpp implements LLM {
       clearTimeout(this.inactivityTimer);
       this.inactivityTimer = null;
     }
+    // A poisoned instance has a native call still running on its contexts:
+    // leak them rather than dispose underneath it.
+    if (this.poisonReason !== null) return null;
     return this.lifecycle.beginUnload(() => this.disposeIdleResources());
   }
 
@@ -1796,6 +1963,7 @@ export class LlamaCpp implements LLM {
     if (this.remoteEmbedder) {
       return this.withOperationLease(async () => (await this.embedRemote([text], options))[0]!);
     }
+    this.assertNotPoisoned();
 
     return this.withOperationLease(async () => {
       // Ping activity at start to keep models alive during this operation
@@ -1829,6 +1997,7 @@ export class LlamaCpp implements LLM {
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (this.remoteEmbedder) return this.withOperationLease(() => this.embedRemote(texts, options));
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     if (texts.length === 0) return [];
 
@@ -1907,6 +2076,7 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     return this.withOperationLease(() => this.generateOnContext(prompt, options));
   }
@@ -1976,6 +2146,7 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     return this.withOperationLease(() => this.expandQueryOnContext(query, options));
   }
@@ -2039,36 +2210,7 @@ export class LlamaCpp implements LLM {
         },
       });
 
-      const lines = result.trim().split("\n");
-      const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-
-      const hasQueryTerm = (text: string): boolean => {
-        const lower = text.toLowerCase();
-        if (queryTerms.length === 0) return true;
-        return queryTerms.some(term => lower.includes(term));
-      };
-
-      const queryables: Queryable[] = lines.map(line => {
-        const colonIdx = line.indexOf(":");
-        if (colonIdx === -1) return null;
-        const type = line.slice(0, colonIdx).trim();
-        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
-        const text = line.slice(colonIdx + 1).trim();
-        if (!hasQueryTerm(text)) return null;
-        return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
-
-      // Filter out lex entries if not requested
-      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
-      if (filtered.length > 0) return filtered;
-
-      const fallback: Queryable[] = [
-        { type: 'hyde', text: `Information about ${query}` },
-        { type: 'lex', text: query },
-        { type: 'vec', text: query },
-      ];
-      return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+      return parseExpansionLines(result, query, includeLexical);
     } catch (error) {
       console.error("Structured query expansion failed:", error);
       // Fallback to original query
@@ -2086,6 +2228,13 @@ export class LlamaCpp implements LLM {
   private static readonly RERANK_TEMPLATE_OVERHEAD = 512;
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
+  /** Load the rerank model and contexts so a caller can time the scoring alone. */
+  async prepareRerank(): Promise<void> {
+    this.assertNotPoisoned();
+    await this.ensureRerankContexts();
+    await this.ensureRerankModel();
+  }
+
   async rerank(
     query: string,
     documents: RerankDocument[],
@@ -2102,6 +2251,7 @@ export class LlamaCpp implements LLM {
         return jevReranker.rerank(query, documents, options.signal);
       });
     }
+    this.assertNotPoisoned();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     return this.withOperationLease(() => this.rerankOnContexts(query, documents));
   }
@@ -2254,6 +2404,9 @@ export class LlamaCpp implements LLM {
    * "disposed" resolve immediately.
    */
   async dispose(): Promise<void> {
+    // A poisoned instance is never disposed: a native call is still running on
+    // its contexts, and the process is going away.
+    if (this.poisonReason !== null) return;
     // Terminal transition is synchronous: new sessions/operations are rejected
     // instead of borrowing resources that are about to be destroyed, and
     // callers parked on an idle unload wake up to the terminal state.
@@ -2340,6 +2493,376 @@ export class LlamaCpp implements LLM {
 }
 
 // =============================================================================
+// OpenAI-compatible Implementation
+// =============================================================================
+
+export type OpenAiLLMConfig = {
+  embedModel?: string;
+  generateModel?: string;
+  rerankModel?: string;
+  /** API root that `/embeddings`, `/rerank` and `/chat/completions` hang off, usually ending in `/v1`. Falls back to QMD_OPENAI_BASE_URL. */
+  baseUrl?: string;
+  /** Bearer token. QMD_OPENAI_API_KEY takes precedence so the key can stay out of a shared index.yml. */
+  apiKey?: string;
+  /**
+   * Extra JSON fields merged into every chat-completion request. Reasoning
+   * models spend the whole token budget thinking and return an empty
+   * `content` unless told not to, and the field that says so differs by
+   * server (`reasoning_effort`, `think`, …) — so it is config, not code.
+   */
+  generateParams?: Record<string, unknown>;
+  /** Roles this instance answers; every one must be an `openai:` URI. Defaults to all three. A mixed setup lists only the remote ones. */
+  roles?: readonly LlmRole[];
+};
+
+export type LlmRole = "embed" | "generate" | "rerank";
+
+export function resolveOpenAiBaseUrl(configured?: string): string | undefined {
+  const raw = configured || process.env.QMD_OPENAI_BASE_URL;
+  return raw ? raw.replace(/\/+$/, "") : undefined;
+}
+
+/** Whether the endpoint is Jina's API, which takes a `task` on embedding requests. */
+export function isJinaEndpoint(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname;
+    return host === "jina.ai" || host.endsWith(".jina.ai");
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the endpoint is OpenRouter, which routes an embedding request by provider. */
+export function isOpenRouterEndpoint(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname;
+    return host === "openrouter.ai" || host.endsWith(".openrouter.ai");
+  } catch {
+    return false;
+  }
+}
+
+/** The Jina key (JINA_API_KEY, else JINA_API), only ever handed to a jina.ai endpoint. */
+function jinaKeyFor(baseUrl: string): string | undefined {
+  return isJinaEndpoint(baseUrl) ? (process.env.JINA_API_KEY || process.env.JINA_API || undefined) : undefined;
+}
+
+// The smallest per-request `input` limit among common embedding providers
+// (DashScope rejects more than 10). Servers with a higher limit just take more
+// round trips, and the concurrency below makes up for it. QMD_OPENAI_EMBED_BATCH_SIZE
+// and QMD_OPENAI_EMBED_CONCURRENCY raise them for endpoints that take more.
+const OPENAI_EMBED_BATCH_SIZE_DEFAULT = 10;
+const OPENAI_EMBED_CONCURRENCY_DEFAULT = 4;
+const OPENAI_EMBED_BATCH_SIZE_MAX = 512;
+const OPENAI_EMBED_CONCURRENCY_MAX = 128;
+const OPENAI_REQUEST_TIMEOUT_MS = 120_000;
+
+// A general chat model has never seen qmd's fine-tuned expansion format, so
+// the prompt spells out what the local model was trained to emit.
+const OPENAI_EXPAND_PROMPT =
+  "Expand this search query for a document search engine. Output only lines, each starting with one of: " +
+  "\"lex: \" (2-5 keywords for full-text search), \"vec: \" (a natural-language rephrasing for semantic search), " +
+  "\"hyde: \" (a one-sentence hypothetical passage that would answer it). Give 1-2 lines per type and nothing else.";
+
+/**
+ * LLM implementation over an OpenAI-compatible HTTP API: `/embeddings`,
+ * `/rerank` (the shape Jina, Voyage, Cohere and llama-server share) and
+ * `/chat/completions`. Nothing is loaded or cached locally, so there is
+ * nothing to pull, unload or dispose.
+ */
+export class OpenAiLLM implements LLM {
+  private readonly baseUrl: string;
+  private readonly apiKey: string | undefined;
+  private readonly generateParams: Record<string, unknown>;
+  private readonly embedModelUri: string;
+  private readonly generateModelUri: string;
+  private readonly rerankModelUri: string;
+
+  constructor(config: OpenAiLLMConfig = {}) {
+    const baseUrl = resolveOpenAiBaseUrl(config.baseUrl);
+    if (!baseUrl) {
+      throw new Error("openai: models need an endpoint: set models.openai_base_url in index.yml or QMD_OPENAI_BASE_URL");
+    }
+    this.baseUrl = baseUrl;
+    this.apiKey = process.env.QMD_OPENAI_API_KEY || config.apiKey || jinaKeyFor(baseUrl);
+    this.generateParams = config.generateParams ?? {};
+    this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
+    this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
+    this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
+    const uriByRole: Record<LlmRole, string> = { embed: this.embedModelUri, generate: this.generateModelUri, rerank: this.rerankModelUri };
+    for (const role of config.roles ?? ["embed", "generate", "rerank"] as const) {
+      if (!isOpenAiModelUri(uriByRole[role])) {
+        throw new Error(`OpenAiLLM needs ${OPENAI_MODEL_PREFIX}<model id> URIs, got ${uriByRole[role]}`);
+      }
+    }
+  }
+
+  get embedModelName(): string {
+    return this.embedModelUri;
+  }
+
+  get generateModelName(): string {
+    return this.generateModelUri;
+  }
+
+  get rerankModelName(): string {
+    return this.rerankModelUri;
+  }
+
+  get endpoint(): string {
+    return this.baseUrl;
+  }
+
+  get embedTuning(): { batchSize: number; concurrency: number } {
+    return {
+      batchSize: readPositiveIntEnv("QMD_OPENAI_EMBED_BATCH_SIZE", OPENAI_EMBED_BATCH_SIZE_DEFAULT, OPENAI_EMBED_BATCH_SIZE_MAX),
+      concurrency: readPositiveIntEnv("QMD_OPENAI_EMBED_CONCURRENCY", OPENAI_EMBED_CONCURRENCY_DEFAULT, OPENAI_EMBED_CONCURRENCY_MAX),
+    };
+  }
+
+  /** The id the server knows: the URI without its `openai:` prefix. */
+  private modelId(uri: string): string {
+    return uri.slice(OPENAI_MODEL_PREFIX.length);
+  }
+
+  private headers(): Record<string, string> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
+    return headers;
+  }
+
+  private async request<T>(path: string, body?: Record<string, unknown>): Promise<T> {
+    const url = `${this.baseUrl}${path}`;
+    const response = await fetch(url, {
+      method: body ? "POST" : "GET",
+      headers: this.headers(),
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(OPENAI_REQUEST_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => "")).slice(0, 300);
+      throw new HttpStatusError(response.status, `${url} answered ${response.status}${detail ? `: ${detail}` : ""}`, parseRetryAfterMs(response.headers.get("retry-after")));
+    }
+    return await response.json() as T;
+  }
+
+  /** Model ids the server lists. Used by `qmd doctor` to prove the endpoint answers. */
+  async listModels(): Promise<string[]> {
+    const data = await this.request<{ data?: { id?: string }[] }>("/models");
+    return (data.data ?? []).map(m => m.id).filter((id): id is string => typeof id === "string");
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    const [result] = await this.embedBatch([text], options);
+    return result ?? null;
+  }
+
+  async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    const model = options.model ?? this.embedModelUri;
+    const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
+    const { batchSize, concurrency } = this.embedTuning;
+    const batchCount = Math.ceil(texts.length / batchSize);
+    // Bulk embeds on OpenRouter pin one provider with no fallback (a slow one
+    // can cost 3x the throughput); queries keep OpenRouter's fallbacks.
+    const provider = process.env.QMD_OPENAI_PROVIDER;
+    const pin = provider && !options.isQuery && isOpenRouterEndpoint(this.baseUrl)
+      ? { provider: { order: [provider], allow_fallbacks: false } }
+      : {};
+    let nextBatch = 0;
+    const worker = async () => {
+      while (nextBatch < batchCount) {
+        const offset = nextBatch++ * batchSize;
+        const input = texts.slice(offset, offset + batchSize);
+        const data = await withRetry(() => this.request<{ data: { index: number; embedding: number[] }[] }>("/embeddings", {
+          model: this.modelId(this.embedModelUri),
+          input,
+          // Jina's retrieval embedders are trained per task; the text itself stays raw.
+          ...(isJinaEndpoint(this.baseUrl) ? { task: options.isQuery ? "retrieval.query" : "retrieval.passage" } : {}),
+          ...pin,
+        }), { onRetry: status => options.onThrottle?.(status) });
+        for (const item of data.data) {
+          results[offset + item.index] = { embedding: item.embedding, model };
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, batchCount) }, worker));
+    return results;
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    const data = await this.request<{ choices?: { message?: { content?: string | null } }[] }>("/chat/completions", {
+      model: this.modelId(this.generateModelUri),
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: options.maxTokens ?? 150,
+      temperature: options.temperature ?? 0.7,
+      stream: false,
+      ...this.generateParams,
+    });
+    return {
+      text: data.choices?.[0]?.message?.content ?? "",
+      model: this.generateModelUri,
+      done: true,
+    };
+  }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    // Whether the server serves it only shows when it is asked; doctor probes the endpoint.
+    return { name: model, exists: true };
+  }
+
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+    const includeLexical = options.includeLexical ?? true;
+    try {
+      const result = await this.generate(`${OPENAI_EXPAND_PROMPT}\n\nQuery: ${query}`, { maxTokens: 600 });
+      // A reasoning model that inlines its thinking would hand the parser lex:/vec: lines it never meant.
+      const text = (result?.text ?? "").replace(/<think>[\s\S]*?<\/think>/g, "");
+      return parseExpansionLines(text, query, includeLexical);
+    } catch (error) {
+      console.error("Structured query expansion failed:", error);
+      const fallback: Queryable[] = [{ type: 'vec', text: query }];
+      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
+      return fallback;
+    }
+  }
+
+  async rerank(query: string, documents: RerankDocument[], _options: RerankOptions = {}): Promise<RerankResult> {
+    if (documents.length === 0) return { results: [], model: this.rerankModelUri };
+
+    // Score each distinct text once, like LlamaCpp.rerank: repeated chunks are common.
+    const textToDocs = new Map<string, { file: string; index: number }[]>();
+    documents.forEach((doc, index) => {
+      const existing = textToDocs.get(doc.text);
+      if (existing) existing.push({ file: doc.file, index });
+      else textToDocs.set(doc.text, [{ file: doc.file, index }]);
+    });
+    const texts = Array.from(textToDocs.keys());
+
+    const data = await this.request<{ results: { index: number; relevance_score: number }[] }>("/rerank", {
+      model: this.modelId(this.rerankModelUri),
+      query,
+      documents: texts,
+    });
+
+    const results: RerankDocumentResult[] = [];
+    for (const item of [...data.results].sort((a, b) => b.relevance_score - a.relevance_score)) {
+      for (const docInfo of textToDocs.get(texts[item.index]!) ?? []) {
+        results.push({ file: docInfo.file, score: item.relevance_score, index: docInfo.index });
+      }
+    }
+    return { results, model: this.rerankModelUri };
+  }
+
+  async dispose(): Promise<void> {}
+}
+
+// =============================================================================
+// Mixed backends
+// =============================================================================
+
+/**
+ * Routes each role to its own backend, so a remote reranker can sit beside
+ * local embeddings (existing vectors stay valid) or the reverse.
+ */
+export class CompositeLLM implements LLM {
+  constructor(
+    readonly embedBackend: LLM,
+    readonly generateBackend: LLM,
+    readonly rerankBackend: LLM,
+  ) {}
+
+  get embedModelName(): string { return this.embedBackend.embedModelName; }
+  get generateModelName(): string { return this.generateBackend.generateModelName; }
+  get rerankModelName(): string { return this.rerankBackend.rerankModelName; }
+  get embedTuning() { return this.embedBackend.embedTuning; }
+
+  embed(text: string, options?: EmbedOptions) { return this.embedBackend.embed(text, options); }
+  embedBatch(texts: string[], options?: EmbedOptions) { return this.embedBackend.embedBatch(texts, options); }
+  generate(prompt: string, options?: GenerateOptions) { return this.generateBackend.generate(prompt, options); }
+  modelExists(model: string) { return this.generateBackend.modelExists(model); }
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }) { return this.generateBackend.expandQuery(query, options); }
+  rerank(query: string, documents: RerankDocument[], options?: RerankOptions) { return this.rerankBackend.rerank(query, documents, options); }
+
+  // Chunking tokenizes with the embedding model's tokenizer.
+  get tokenize() { return this.embedBackend.tokenize?.bind(this.embedBackend); }
+  get detokenize() { return this.embedBackend.detokenize?.bind(this.embedBackend); }
+
+  // Absent when the reranker is remote: there is nothing to load or poison.
+  get prepareRerank() { return this.rerankBackend.prepareRerank?.bind(this.rerankBackend); }
+  get poison() { return this.rerankBackend.poison?.bind(this.rerankBackend); }
+
+  async dispose(): Promise<void> {
+    await Promise.all([...new Set([this.embedBackend, this.generateBackend, this.rerankBackend])].map(b => b.dispose()));
+  }
+}
+
+// =============================================================================
+// Backend selection
+// =============================================================================
+
+export type LlmConfig = ModelResolutionConfig & {
+  embedOptions?: RemoteEmbedOptions;
+  rerankOptions?: JevRerankOptions;
+  openaiBaseUrl?: string;
+  openaiApiKey?: string;
+  openaiGenerateParams?: Record<string, unknown>;
+} & Pick<LlamaCppConfig, "inactivityTimeoutMs" | "disposeModelsOnInactivity">;
+
+/**
+ * Build the backend the configured model URIs ask for: `openai:` ids go to an
+ * OpenAI-compatible server, anything else (`hf:` or a GGUF path) to
+ * node-llama-cpp. The three roles must agree — one backend per store keeps
+ * sessions, unloading and doctor simple.
+ */
+export function createLlm(config: LlmConfig = {}): LLM {
+  const models = resolveModels(config);
+  const remote = [models.embed, models.generate, models.rerank].filter(isOpenAiModelUri).length;
+  if (remote === 0) {
+    return new LlamaCpp({
+      embedModel: models.embed,
+      embedOptions: config.embedOptions,
+      generateModel: models.generate,
+      rerankModel: models.rerank,
+      rerankOptions: config.rerankOptions,
+      inactivityTimeoutMs: config.inactivityTimeoutMs,
+      disposeModelsOnInactivity: config.disposeModelsOnInactivity,
+    });
+  }
+  if (remote < 3) {
+    // Mixed: each role goes to its own backend (e.g. remote rerank, local embed).
+    const uri: Record<LlmRole, string> = { embed: models.embed, generate: models.generate, rerank: models.rerank };
+    const remoteRoles = (Object.keys(uri) as LlmRole[]).filter(role => isOpenAiModelUri(uri[role]));
+    const remoteLlm = new OpenAiLLM({
+      embedModel: models.embed,
+      generateModel: models.generate,
+      rerankModel: models.rerank,
+      baseUrl: config.openaiBaseUrl,
+      apiKey: config.openaiApiKey,
+      generateParams: config.openaiGenerateParams,
+      roles: remoteRoles,
+    });
+    const localLlm = new LlamaCpp({
+      embedModel: remoteRoles.includes("embed") ? undefined : models.embed,
+      embedOptions: remoteRoles.includes("embed") ? undefined : config.embedOptions,
+      generateModel: remoteRoles.includes("generate") ? undefined : models.generate,
+      rerankModel: remoteRoles.includes("rerank") ? undefined : models.rerank,
+      rerankOptions: remoteRoles.includes("rerank") ? undefined : config.rerankOptions,
+      inactivityTimeoutMs: config.inactivityTimeoutMs,
+      disposeModelsOnInactivity: config.disposeModelsOnInactivity,
+    });
+    const pick = (role: LlmRole): LLM => remoteRoles.includes(role) ? remoteLlm : localLlm;
+    return new CompositeLLM(pick("embed"), pick("generate"), pick("rerank"));
+  }
+  return new OpenAiLLM({
+    embedModel: models.embed,
+    generateModel: models.generate,
+    rerankModel: models.rerank,
+    baseUrl: config.openaiBaseUrl,
+    apiKey: config.openaiApiKey,
+    generateParams: config.openaiGenerateParams,
+  });
+}
+
+// =============================================================================
 // Session Management Layer
 // =============================================================================
 
@@ -2363,14 +2886,14 @@ export class SessionReleasedError extends Error {
  * unload while the lease is held.
  */
 class LLMSession implements ILLMSession {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private lifecycle: LlmResourceLifecycle;
   private released = false;
   private abortController: AbortController;
   private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
   private name: string;
 
-  private constructor(llm: LlamaCpp, lifecycle: LlmResourceLifecycle, options: LLMSessionOptions = {}) {
+  private constructor(llm: LLM, lifecycle: LlmResourceLifecycle, options: LLMSessionOptions = {}) {
     this.llm = llm;
     this.lifecycle = lifecycle;
     this.name = options.name || "unnamed";
@@ -2403,7 +2926,7 @@ class LLMSession implements ILLMSession {
    * Parks while an idle unload is disposing resources, so a lease is only ever
    * granted on a ready instance, and rejects once the instance terminates.
    */
-  static async open(llm: LlamaCpp, options: LLMSessionOptions = {}): Promise<LLMSession> {
+  static async open(llm: LLM, options: LLMSessionOptions = {}): Promise<LLMSession> {
     const lifecycle = lifecycleFor(llm);
     await lifecycle.acquireSessionLease();
     try {
@@ -2499,7 +3022,7 @@ class LLMSession implements ILLMSession {
  * callback throws.
  */
 async function runWithSession<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -2533,14 +3056,14 @@ export async function withLLMSession<T>(
 }
 
 /**
- * Execute a function with a scoped LLM session using a specific LlamaCpp instance.
+ * Execute a function with a scoped LLM session using a specific LLM instance.
  * Unlike withLLMSession, this does not use the global singleton.
  *
  * The session is counted on that instance's lifecycle, so its idle timer will
  * not unload resources while the session is open.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -2616,17 +3139,18 @@ export function isDarwinExitGuardInstalled(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton for the default LLM instance
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLlamaCpp: LLM | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
+ * Get the default LLM instance (creates a LlamaCpp if needed). The LlamaCpp
  * constructor installs the darwin exit guard, so any code path that obtains
- * the singleton is protected.
+ * the singleton is protected. The name predates `OpenAiLLM`; the CLI sets
+ * whichever backend `createLlm` chose.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
+export function getDefaultLlamaCpp(): LLM {
   if (!defaultLlamaCpp) {
     defaultLlamaCpp = new LlamaCpp();
   }
@@ -2634,12 +3158,12 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing). Setting a
+ * Set a custom default LLM instance (useful for testing). Setting a
  * non-null instance also ensures the darwin exit guard is installed — keeps
  * the invariant intact for test doubles that didn't go through the real
  * constructor.
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function setDefaultLlamaCpp(llm: LLM | null): void {
   if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
 }
