@@ -15,7 +15,7 @@ import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
-import { createStore, getEmbeddingFingerprint, insertContent, insertDocument } from "../src/store.ts";
+import { createStore, insertContent, insertDocument } from "../src/store.ts";
 import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE, VEC_TABLE } from "../src/vec-layout.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
@@ -1309,20 +1309,26 @@ describe("CLI Update Command", () => {
     const configPath = join(testConfigDir, "index.yml");
     const configText = readFileSync(configPath, "utf8");
     // The CLI persists resolved models into the config, which wins over the env var.
-    writeFileSync(configPath, configText.replace(/^(\s*embed:).*$/m, `$1 ${customModel}`));
+    const hasEmbedKey = /^\s*embed:/m.test(configText);
+    writeFileSync(
+      configPath,
+      hasEmbedKey
+        ? configText.replace(/^(\s*embed:).*$/m, `$1 ${customModel}`)
+        : `${configText.replace(/\n*$/, "\n")}models:\n  embed: ${customModel}\n`,
+    );
 
     // Every active doc is already embedded under the configured model.
-    const db = openDatabase(localDbPath);
-    const hashes = db.prepare(`SELECT DISTINCT hash FROM documents WHERE active = 1`).all() as { hash: string }[];
-    expect(hashes.length).toBeGreaterThan(0);
-    const now = new Date().toISOString();
-    const insert = db.prepare(`
-      INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
-      VALUES (?, 0, 0, ?, ?, 1, ?)
-    `);
-    const fingerprint = getEmbeddingFingerprint(customModel);
-    for (const { hash } of hashes) insert.run(hash, customModel, fingerprint, now);
-    db.close();
+    // Partition rows are written too: update re-queues any chunk without one.
+    const store = createStore(localDbPath);
+    try {
+      const hashes = store.db.prepare(`SELECT DISTINCT hash FROM documents WHERE active = 1`).all() as { hash: string }[];
+      expect(hashes.length).toBeGreaterThan(0);
+      const now = new Date().toISOString();
+      store.ensureVecTable(3);
+      for (const { hash } of hashes) store.insertEmbedding(hash, 0, 0, new Float32Array([1, 2, 3]), customModel, now);
+    } finally {
+      store.close();
+    }
 
     const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath, env });
     expect(exitCode).toBe(0);

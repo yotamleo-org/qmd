@@ -436,12 +436,16 @@ describe("bin/qmd package wrapper", () => {
   // a process blocked in native llama.cpp) and assert it is still reaped.
   test.skipIf(process.platform === "win32")("SIGTERM to the launcher does not orphan the CLI child", async () => {
     const { root, runtimeBin } = makeTempFixture();
-    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd");
+    // A bun lockfile under a Node launcher makes the trampoline spawn `bun`
+    // (an in-process import has no child to orphan); the stub bun runs the CLI
+    // under real Node.
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["bun.lock"]);
+    writeFileSync(join(runtimeBin, "bun"), `#!/bin/sh\nexec "${REAL_NODE}" "$@"\n`);
     const pidPath = join(root, "child.pid");
     writeFileSync(
       join(packageRoot, "dist", "cli", "qmd.js"),
       [
-        'const { writeFileSync } = require("node:fs");',
+        'import { writeFileSync } from "node:fs";',
         'process.on("SIGTERM", () => {});',
         `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
         'setInterval(() => {}, 1000);',
