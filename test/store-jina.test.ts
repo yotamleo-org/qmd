@@ -43,15 +43,22 @@ function addVector(hash: string, model: string): void {
 }
 
 function stubLlm(model: string, seen: { isQuery?: boolean }[] = []): LLM {
+  const unused = async (): Promise<never> => { throw new Error("stub LLM: not used by these tests"); };
   return {
     embedModelName: model,
-    embedBatch: async (texts: string[], opts?: { isQuery?: boolean }) => {
+    generateModelName: model,
+    rerankModelName: model,
+    embedBatch: async (texts, opts) => {
       seen.push({ isQuery: opts?.isQuery });
       return texts.map(() => ({ embedding: [0.1, 0.2, 0.3], model }));
     },
     embed: async () => ({ embedding: [0.1, 0.2, 0.3], model }),
+    generate: unused,
+    modelExists: unused,
+    expandQuery: unused,
+    rerank: unused,
     dispose: async () => {},
-  } satisfies Partial<LLM> as unknown as LLM;
+  };
 }
 
 beforeEach(async () => {
