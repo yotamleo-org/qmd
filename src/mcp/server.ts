@@ -38,7 +38,7 @@ import {
 import { getConfigPath } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
-import { isLlamaPoisoned, killProcessNow } from "../llm.js";
+import { isLlamaPoisoned } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
 
@@ -48,14 +48,15 @@ import { checkBearer } from "./auth.js";
 
 /**
  * A rerank that timed out leaves a native call spinning forever (it ignores
- * SIGTERM), so the process is unusable. Answer with the fallback results that
- * are already on their way, then kill the process (exit() would block on the
- * stuck native thread). A supervisor, if any, restarts the server.
+ * SIGTERM) and poisons the process, so searches skip rerank from then on (see
+ * hybridQuery/structuredSearch). The daemon keeps serving unreranked results;
+ * killing it would only repeat the hang on the next query.
  */
-function exitIfRerankHung(): void {
-  if (!isLlamaPoisoned()) return;
-  console.error("QMD: rerank (or its model load) timed out; served unreranked results and killing the process (restart the server)");
-  setTimeout(() => killProcessNow(), 1000);
+let rerankHangLogged = false;
+export function exitIfRerankHung(): void {
+  if (!isLlamaPoisoned() || rerankHangLogged) return;
+  rerankHangLogged = true;
+  console.error("QMD: rerank (or its model load) timed out; serving unreranked results from now on (QMD_RERANK=off skips the reranker at startup)");
 }
 
 type SearchResultItem = {

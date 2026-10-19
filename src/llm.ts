@@ -333,6 +333,12 @@ export function resolveRerankModel(config?: ModelResolutionConfig): string {
   return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
 }
 
+/** QMD_RERANK=off (also 0 or false) turns reranking off process-wide: the reranker is never loaded. */
+export function isRerankDisabled(): boolean {
+  const v = process.env.QMD_RERANK?.trim().toLowerCase();
+  return v === "off" || v === "0" || v === "false";
+}
+
 const DEFAULT_RERANK_TIMEOUT_MS = 60_000;
 const MAX_TIMER_MS = 2_147_483_647;
 
@@ -387,6 +393,9 @@ export function killProcessNow(): never {
 }
 export function resetLlamaPoisonedForTests(): void {
   llamaPoisoned = false;
+}
+export function markLlamaPoisonedForTests(): void {
+  llamaPoisoned = true;
 }
 
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
