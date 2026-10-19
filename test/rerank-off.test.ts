@@ -13,6 +13,7 @@ import { resetLlamaPoisonedForTests } from "../src/llm.js";
 import {
   createStore,
   structuredSearch,
+  hybridQuery,
   insertContent,
   insertDocument,
   hashContent,
@@ -89,6 +90,60 @@ describe("QMD_RERANK=off", () => {
   });
 });
 
+describe("hybridQuery", () => {
+  // Expansion is stubbed (it would load a model); no vector index skips the vector leg.
+  async function seed(): Promise<void> {
+    vi.spyOn(store, "expandQuery").mockResolvedValue([]);
+    await insertDoc("a.md", "# Alpha\n\nzebrafish keyword zebrafish zebrafish");
+    await insertDoc("b.md", "# Beta\n\nzebrafish keyword");
+  }
+
+  test("QMD_RERANK=off: hybridQuery never calls store.rerank", async () => {
+    await seed();
+    const rerank = vi.spyOn(store, "rerank");
+    process.env.QMD_RERANK = "off";
+
+    const results = await hybridQuery(store, "zebrafish keyword", {});
+
+    expect(results.length).toBe(2);
+    expect(rerank).not.toHaveBeenCalled();
+    expect(results.every(r => r.rerankTimedOut === undefined)).toBe(true);
+  });
+
+  test("hybridQuery calls store.rerank when reranking is on", async () => {
+    await seed();
+    const rerank = vi.spyOn(store, "rerank").mockResolvedValue([{ file: "a.md", score: 1 }, { file: "b.md", score: 0.5 }]);
+
+    await hybridQuery(store, "zebrafish keyword", {});
+
+    expect(rerank).toHaveBeenCalledTimes(1);
+  });
+
+  test("hybridQuery skips store.rerank once the process is poisoned", async () => {
+    await seed();
+    const rerank = vi.spyOn(store, "rerank");
+    llmModule.markLlamaPoisonedForTests();
+
+    const results = await hybridQuery(store, "zebrafish keyword", {});
+
+    expect(results.length).toBe(2);
+    expect(rerank).not.toHaveBeenCalled();
+  });
+
+  test("a rerank refused because a concurrent search poisoned the process falls back to RRF", async () => {
+    await seed();
+    vi.spyOn(store, "rerank").mockImplementation(async () => {
+      llmModule.markLlamaPoisonedForTests();
+      throw new Error("LlamaCpp instance is poisoned (rerank timed out); restart the process");
+    });
+
+    const results = await hybridQuery(store, "zebrafish keyword", {});
+
+    expect(results.length).toBe(2);
+    expect(results.every(r => r.rerankTimedOut === true)).toBe(true);
+  });
+});
+
 describe("hung rerank is remembered per process", () => {
   test("after one hang, later searches skip rerank instead of calling it again", async () => {
     await insertDoc("a.md", "# A\n\nhang keyword");
@@ -136,7 +191,8 @@ describe("hung rerank is remembered per process", () => {
   test("exitIfRerankHung trusts the store's effective models over the raw config", () => {
     const local = { internal: { llm: { embedModelName: "hf:example/embed/local.gguf", generateModelName: "openai:generate" } } } as any;
     const remote = { internal: { llm: { embedModelName: "openai:embed", generateModelName: "openai:generate" } } } as any;
-    const saved = process.env.QMD_EMBED_MODEL;
+    const saved = MODEL_ENV.map(k => process.env[k]);
+    process.env.QMD_CONFIG_DIR = testDir;
     process.env.QMD_EMBED_MODEL = "openai:embed";
     const armed = vi.spyOn(globalThis, "setTimeout").mockImplementation((() => 0) as any);
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -147,8 +203,10 @@ describe("hung rerank is remembered per process", () => {
       exitIfRerankHung(local);
       expect(armed).toHaveBeenCalledTimes(1);
     } finally {
-      if (saved === undefined) delete process.env.QMD_EMBED_MODEL;
-      else process.env.QMD_EMBED_MODEL = saved;
+      MODEL_ENV.forEach((k, i) => {
+        if (saved[i] === undefined) delete process.env[k];
+        else process.env[k] = saved[i];
+      });
     }
   });
 

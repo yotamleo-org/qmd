@@ -6639,7 +6639,8 @@ export async function hybridQuery(
   try {
     reranked = await store.rerank(query, chunksToRerank, undefined, intent);
   } catch (err) {
-    if (!(err instanceof RerankTimeoutError)) throw err;
+    // A concurrent search may have poisoned the process after the skip check above.
+    if (!(err instanceof RerankTimeoutError || isLlamaPoisoned())) throw err;
     // Fall back to the unreranked hybrid (RRF) order.
     rerankTimedOut = true;
     reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
@@ -7045,7 +7046,8 @@ export async function structuredSearch(
   try {
     reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
   } catch (err) {
-    if (!(err instanceof RerankTimeoutError)) throw err;
+    // A concurrent search may have poisoned the process after the skip check above.
+    if (!(err instanceof RerankTimeoutError || isLlamaPoisoned())) throw err;
     // Fall back to the unreranked hybrid (RRF) order.
     rerankTimedOut = true;
     reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
