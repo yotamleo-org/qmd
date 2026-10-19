@@ -40,7 +40,6 @@ afterEach(() => {
   delete process.env.QMD_RERANK;
   delete process.env.QMD_RERANK_TIMEOUT_MS;
   resetLlamaPoisonedForTests();
-  vi.useRealTimers();
   vi.restoreAllMocks();
   store.close();
 });
@@ -107,37 +106,34 @@ describe("hung rerank is remembered per process", () => {
     expect(llm.rerank).toHaveBeenCalledTimes(1);
   });
 
-  test("exitIfRerankHung does not kill a daemon whose embed and generate models are remote", () => {
-    vi.useFakeTimers();
-    vi.stubEnv("QMD_CONFIG_DIR", testDir);
-    vi.stubEnv("QMD_EMBED_MODEL", "openai:embed");
-    vi.stubEnv("QMD_GENERATE_MODEL", "openai:generate");
-    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as any);
+  const MODEL_ENV = ["QMD_CONFIG_DIR", "QMD_EMBED_MODEL", "QMD_GENERATE_MODEL"] as const;
+
+  /** Runs exitIfRerankHung twice with the given model env and returns how many kill timers it armed. */
+  function armedKills(embed: string, generate: string): number {
+    const saved = MODEL_ENV.map(k => process.env[k]);
+    process.env.QMD_CONFIG_DIR = testDir;
+    process.env.QMD_EMBED_MODEL = embed;
+    process.env.QMD_GENERATE_MODEL = generate;
+    const armed = vi.spyOn(globalThis, "setTimeout").mockImplementation((() => 0) as any);
     vi.spyOn(console, "error").mockImplementation(() => {});
     llmModule.markLlamaPoisonedForTests();
+    try {
+      exitIfRerankHung();
+      exitIfRerankHung();
+      return armed.mock.calls.length;
+    } finally {
+      MODEL_ENV.forEach((k, i) => {
+        if (saved[i] === undefined) delete process.env[k];
+        else process.env[k] = saved[i];
+      });
+    }
+  }
 
-    exitIfRerankHung();
-    exitIfRerankHung();
-    vi.advanceTimersByTime(5000);
-
-    expect(kill).not.toHaveBeenCalled();
-    vi.unstubAllEnvs();
+  test("exitIfRerankHung does not kill a daemon whose embed and generate models are remote", () => {
+    expect(armedKills("openai:embed", "openai:generate")).toBe(0);
   });
 
   test("exitIfRerankHung still kills a daemon with a local embed model, which the poisoned instance refuses", () => {
-    vi.useFakeTimers();
-    vi.stubEnv("QMD_CONFIG_DIR", testDir);
-    vi.stubEnv("QMD_EMBED_MODEL", "hf:example/embed/local.gguf");
-    vi.stubEnv("QMD_GENERATE_MODEL", "openai:generate");
-    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as any);
-    vi.spyOn(process, "exit").mockImplementation((() => undefined) as any);
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    llmModule.markLlamaPoisonedForTests();
-
-    exitIfRerankHung();
-    vi.advanceTimersByTime(5000);
-
-    expect(kill).toHaveBeenCalledTimes(1);
-    vi.unstubAllEnvs();
+    expect(armedKills("hf:example/embed/local.gguf", "openai:generate")).toBe(2);
   });
 });
