@@ -56,9 +56,9 @@ import { checkBearer } from "./auth.js";
  * the stuck native thread) and a supervisor, if any, restarts the server.
  */
 let rerankHangLogged = false;
-export function exitIfRerankHung(): void {
+export function exitIfRerankHung(store?: QMDStore): void {
   if (!isLlamaPoisoned()) return;
-  if (localModelsNeedNative()) {
+  if (localModelsNeedNative(store)) {
     console.error("QMD: rerank (or its model load) timed out; served unreranked results and killing the process (restart the server)");
     setTimeout(() => killProcessNow(), 1000);
     return;
@@ -68,8 +68,13 @@ export function exitIfRerankHung(): void {
   console.error("QMD: rerank (or its model load) timed out; serving unreranked results from now on (QMD_RERANK=off skips the reranker at startup)");
 }
 
-/** True when embedding or query expansion still runs on the local (poisoned) llama instance. */
-function localModelsNeedNative(): boolean {
+/**
+ * True when embedding or query expansion still runs on the local (poisoned) llama instance.
+ * The store's effective models win: createStore may replace the raw config's models with defaults.
+ */
+function localModelsNeedNative(store?: QMDStore): boolean {
+  const llm = store?.internal.llm;
+  if (llm) return !isOpenAiModelUri(llm.embedModelName) || !isOpenAiModelUri(llm.generateModelName);
   let models: ReturnType<typeof resolveModels>;
   try {
     models = resolveModels(loadConfig().models);
@@ -659,7 +664,7 @@ Intent-aware lex (C++ performance, not sports):
         || searches?.[0]?.query
         || "";
 
-      exitIfRerankHung();
+      exitIfRerankHung(store);
 
       const filtered: SearchResultItem[] = results.map(r => {
         const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
@@ -1467,7 +1472,7 @@ export async function startMcpHttpServer(
 
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ results: formatted }));
-        exitIfRerankHung();
+        exitIfRerankHung(store);
         log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }

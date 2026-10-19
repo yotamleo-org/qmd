@@ -133,6 +133,25 @@ describe("hung rerank is remembered per process", () => {
     expect(armedKills("openai:embed", "openai:generate")).toBe(0);
   });
 
+  test("exitIfRerankHung trusts the store's effective models over the raw config", () => {
+    const local = { internal: { llm: { embedModelName: "hf:example/embed/local.gguf", generateModelName: "openai:generate" } } } as any;
+    const remote = { internal: { llm: { embedModelName: "openai:embed", generateModelName: "openai:generate" } } } as any;
+    const saved = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "openai:embed";
+    const armed = vi.spyOn(globalThis, "setTimeout").mockImplementation((() => 0) as any);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    llmModule.markLlamaPoisonedForTests();
+    try {
+      exitIfRerankHung(remote);
+      expect(armed).not.toHaveBeenCalled();
+      exitIfRerankHung(local);
+      expect(armed).toHaveBeenCalledTimes(1);
+    } finally {
+      if (saved === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = saved;
+    }
+  });
+
   test("exitIfRerankHung still kills a daemon with a local embed model, which the poisoned instance refuses", () => {
     expect(armedKills("hf:example/embed/local.gguf", "openai:generate")).toBe(2);
   });
