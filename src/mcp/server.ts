@@ -35,10 +35,10 @@ import {
   MetadataBindingBudgetError,
   MetadataOptionError,
 } from "../index.js";
-import { getConfigPath } from "../collections.js";
+import { getConfigPath, loadConfig } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
-import { isLlamaPoisoned } from "../llm.js";
+import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, resolveModels } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
 
@@ -49,14 +49,34 @@ import { checkBearer } from "./auth.js";
 /**
  * A rerank that timed out leaves a native call spinning forever (it ignores
  * SIGTERM) and poisons the process, so searches skip rerank from then on (see
- * hybridQuery/structuredSearch). The daemon keeps serving unreranked results;
- * killing it would only repeat the hang on the next query.
+ * hybridQuery/structuredSearch). With embedding and query expansion served
+ * remotely the daemon keeps serving unreranked results; killing it would only
+ * repeat the hang on the next query. A local embed or generate model is refused
+ * by the poisoned instance, so then the process is killed (exit() would block on
+ * the stuck native thread) and a supervisor, if any, restarts the server.
  */
 let rerankHangLogged = false;
 export function exitIfRerankHung(): void {
-  if (!isLlamaPoisoned() || rerankHangLogged) return;
+  if (!isLlamaPoisoned()) return;
+  if (localModelsNeedNative()) {
+    console.error("QMD: rerank (or its model load) timed out; served unreranked results and killing the process (restart the server)");
+    setTimeout(() => killProcessNow(), 1000);
+    return;
+  }
+  if (rerankHangLogged) return;
   rerankHangLogged = true;
   console.error("QMD: rerank (or its model load) timed out; serving unreranked results from now on (QMD_RERANK=off skips the reranker at startup)");
+}
+
+/** True when embedding or query expansion still runs on the local (poisoned) llama instance. */
+function localModelsNeedNative(): boolean {
+  let models: ReturnType<typeof resolveModels>;
+  try {
+    models = resolveModels(loadConfig().models);
+  } catch {
+    models = resolveModels();
+  }
+  return !isOpenAiModelUri(models.embed) || !isOpenAiModelUri(models.generate);
 }
 
 type SearchResultItem = {
@@ -146,7 +166,7 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
   }
   if (results.some(r => r.rerankTimedOut)) {
-    lines.push('\nNote: the reranker timed out; results are unreranked (RRF order) and the server is restarting.');
+    lines.push('\nNote: the reranker timed out; results are unreranked (RRF order).');
   }
   return lines.join('\n');
 }

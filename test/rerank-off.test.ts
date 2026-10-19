@@ -107,8 +107,11 @@ describe("hung rerank is remembered per process", () => {
     expect(llm.rerank).toHaveBeenCalledTimes(1);
   });
 
-  test("exitIfRerankHung does not kill the daemon", () => {
+  test("exitIfRerankHung does not kill a daemon whose embed and generate models are remote", () => {
     vi.useFakeTimers();
+    vi.stubEnv("QMD_CONFIG_DIR", testDir);
+    vi.stubEnv("QMD_EMBED_MODEL", "openai:embed");
+    vi.stubEnv("QMD_GENERATE_MODEL", "openai:generate");
     const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as any);
     vi.spyOn(console, "error").mockImplementation(() => {});
     llmModule.markLlamaPoisonedForTests();
@@ -118,5 +121,23 @@ describe("hung rerank is remembered per process", () => {
     vi.advanceTimersByTime(5000);
 
     expect(kill).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+
+  test("exitIfRerankHung still kills a daemon with a local embed model, which the poisoned instance refuses", () => {
+    vi.useFakeTimers();
+    vi.stubEnv("QMD_CONFIG_DIR", testDir);
+    vi.stubEnv("QMD_EMBED_MODEL", "hf:example/embed/local.gguf");
+    vi.stubEnv("QMD_GENERATE_MODEL", "openai:generate");
+    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as any);
+    vi.spyOn(process, "exit").mockImplementation((() => undefined) as any);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    llmModule.markLlamaPoisonedForTests();
+
+    exitIfRerankHung();
+    vi.advanceTimersByTime(5000);
+
+    expect(kill).toHaveBeenCalledTimes(1);
+    vi.unstubAllEnvs();
   });
 });
