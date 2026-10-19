@@ -84,7 +84,7 @@
     "@types/bun": "1.4.3",
     "oxlint": "1.78.0",
     "tsx": "4.23.12",
-    "vitest": "3.2.7"
+    "vitest": "4.1.11"
   },
   "overrides": {
     "postcss": "^8.5.23",
