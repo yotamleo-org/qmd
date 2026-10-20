@@ -393,6 +393,7 @@ export function killProcessNow(): never {
 }
 
 const RERANK_HANG_MEMORY_MS = 60 * 60 * 1000;
+const RERANK_HANG_CLOCK_SKEW_MS = 60 * 1000;
 
 function rerankHangMarkerPath(): string {
   return join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "qmd", "rerank-hung");
@@ -426,9 +427,10 @@ let rerankHangSeenAtStartup = readRerankHangMarker();
 export function isRerankHangRemembered(): boolean {
   if (llamaPoisoned) return true;
   if (rerankHangSeenAtStartup === undefined) return false;
-  // A marker dated in the future (clock stepped back, copied file) is not a recent hang.
+  // A marker dated well in the future (clock stepped back, copied file) is not a recent hang;
+  // a minute of slack covers file timestamps running slightly ahead of Date.now() (seen on macOS).
   const age = Date.now() - rerankHangSeenAtStartup;
-  return age >= 0 && age < RERANK_HANG_MEMORY_MS;
+  return age > -RERANK_HANG_CLOCK_SKEW_MS && age < RERANK_HANG_MEMORY_MS;
 }
 
 export function resetLlamaPoisonedForTests(): void {

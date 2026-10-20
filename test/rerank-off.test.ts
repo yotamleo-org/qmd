@@ -292,6 +292,20 @@ describe("a daemon with local models restarts at most once for a hung rerank", (
     expect(llm.rerank).toHaveBeenCalledTimes(1);
   });
 
+  test("a marker dated a few seconds ahead of the clock still counts (file timestamps can run ahead)", async () => {
+    await insertDoc("a.md", "# A\n\nskew keyword");
+    hangAndRestart();
+    const ahead = new Date(Date.now() + 5 * 1000);
+    utimesSync(markerPath(), ahead, ahead);
+    llmModule.restartForTests();
+    const llm = hangingLlm();
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+
+    await structuredSearch(store, [{ type: "lex", query: "skew keyword" }], {});
+
+    expect(llm.rerank).not.toHaveBeenCalled();
+  });
+
   test("a marker another process writes while this one runs does not switch its rerank off", async () => {
     await insertDoc("a.md", "# A\n\nrunning keyword");
     mkdirSync(join(process.env.XDG_CACHE_HOME!, "qmd"), { recursive: true });
