@@ -6,7 +6,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
-import { existsSync, utimesSync } from "node:fs";
+import { existsSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as llmModule from "../src/llm.js";
@@ -268,6 +268,19 @@ describe("a daemon with local models restarts at most once for a hung rerank", (
     vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
 
     await structuredSearch(store, [{ type: "lex", query: "stale keyword" }], {});
+
+    expect(llm.rerank).toHaveBeenCalledTimes(1);
+  });
+
+  test("an unwritable cache dir still kills the daemon and the next search reranks as before", async () => {
+    await insertDoc("a.md", "# A\n\nunwritable keyword");
+    process.env.XDG_CACHE_HOME = join(testDir, "not-a-dir");
+    writeFileSync(process.env.XDG_CACHE_HOME, "a file where the cache dir should be");
+    expect(() => hangAndRestart()).not.toThrow();
+    const llm = hangingLlm();
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+
+    await structuredSearch(store, [{ type: "lex", query: "unwritable keyword" }], {});
 
     expect(llm.rerank).toHaveBeenCalledTimes(1);
   });
