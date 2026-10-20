@@ -6,7 +6,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
-import { existsSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as llmModule from "../src/llm.js";
@@ -39,11 +39,15 @@ beforeEach(() => {
   process.env.QMD_RERANK_TIMEOUT_MS = "50";
   savedCacheHome = process.env.XDG_CACHE_HOME;
   process.env.XDG_CACHE_HOME = join(testDir, `cache-${Math.random().toString(36).slice(2)}`);
+  llmModule.restartForTests();
 });
 
 afterEach(() => {
   delete process.env.QMD_RERANK;
   delete process.env.QMD_RERANK_TIMEOUT_MS;
+  // The snapshot is module state: leave it empty for whatever test file runs next in this process.
+  rmSync(process.env.XDG_CACHE_HOME!, { recursive: true, force: true });
+  llmModule.restartForTests();
   if (savedCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
   else process.env.XDG_CACHE_HOME = savedCacheHome;
   resetLlamaPoisonedForTests();
@@ -244,6 +248,7 @@ describe("a daemon with local models restarts at most once for a hung rerank", (
     }
     vi.restoreAllMocks();
     resetLlamaPoisonedForTests();
+    llmModule.restartForTests();
   }
 
   test("the restarted process serves unreranked instead of hanging and being killed again", async () => {
@@ -264,10 +269,37 @@ describe("a daemon with local models restarts at most once for a hung rerank", (
     expect(existsSync(markerPath())).toBe(true);
     const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
     utimesSync(markerPath(), old, old);
+    llmModule.restartForTests();
     const llm = hangingLlm();
     vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
 
     await structuredSearch(store, [{ type: "lex", query: "stale keyword" }], {});
+
+    expect(llm.rerank).toHaveBeenCalledTimes(1);
+  });
+
+  test("a marker dated in the future is ignored, so a clock step back cannot keep rerank off", async () => {
+    await insertDoc("a.md", "# A\n\nfuture keyword");
+    hangAndRestart();
+    const future = new Date(Date.now() + 10 * 60 * 60 * 1000);
+    utimesSync(markerPath(), future, future);
+    llmModule.restartForTests();
+    const llm = hangingLlm();
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+
+    await structuredSearch(store, [{ type: "lex", query: "future keyword" }], {});
+
+    expect(llm.rerank).toHaveBeenCalledTimes(1);
+  });
+
+  test("a marker another process writes while this one runs does not switch its rerank off", async () => {
+    await insertDoc("a.md", "# A\n\nrunning keyword");
+    mkdirSync(join(process.env.XDG_CACHE_HOME!, "qmd"), { recursive: true });
+    writeFileSync(markerPath(), String(Date.now()));
+    const llm = hangingLlm();
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+
+    await structuredSearch(store, [{ type: "lex", query: "running keyword" }], {});
 
     expect(llm.rerank).toHaveBeenCalledTimes(1);
   });

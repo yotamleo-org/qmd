@@ -410,14 +410,25 @@ export function recordRerankHang(): void {
   } catch { /* best effort: without the marker the restart just retries the rerank */ }
 }
 
-/** True when this process is poisoned, or a process was killed over a hung rerank within the last hour. */
+function readRerankHangMarker(): number | undefined {
+  try {
+    return statSync(rerankHangMarkerPath()).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+// Read once at startup: only a process started after the kill skips rerank, not
+// a healthy process that happens to be running when another one is killed.
+let rerankHangSeenAtStartup = readRerankHangMarker();
+
+/** True when this process is poisoned, or it started within an hour after a process was killed over a hung rerank. */
 export function isRerankHangRemembered(): boolean {
   if (llamaPoisoned) return true;
-  try {
-    return Date.now() - statSync(rerankHangMarkerPath()).mtimeMs < RERANK_HANG_MEMORY_MS;
-  } catch {
-    return false;
-  }
+  if (rerankHangSeenAtStartup === undefined) return false;
+  // A marker dated in the future (clock stepped back, copied file) is not a recent hang.
+  const age = Date.now() - rerankHangSeenAtStartup;
+  return age >= 0 && age < RERANK_HANG_MEMORY_MS;
 }
 
 export function resetLlamaPoisonedForTests(): void {
@@ -425,6 +436,10 @@ export function resetLlamaPoisonedForTests(): void {
 }
 export function markLlamaPoisonedForTests(): void {
   llamaPoisoned = true;
+}
+/** Re-reads the hang marker as a freshly started process would. */
+export function restartForTests(): void {
+  rerankHangSeenAtStartup = readRerankHangMarker();
 }
 
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
