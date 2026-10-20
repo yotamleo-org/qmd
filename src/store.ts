@@ -68,6 +68,7 @@ import {
   RerankTimeoutError,
   RerankLoadTimeoutError,
   isRerankDisabled,
+  isRerankHangRemembered,
   isLlamaPoisoned,
   type RerankDocument,
   type ILLMSession,
@@ -6415,7 +6416,7 @@ export async function hybridQuery(
   const filter = options?.filter;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled() || isLlamaPoisoned();
+  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled() || isRerankHangRemembered();
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -6843,7 +6844,7 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled() || isLlamaPoisoned();
+  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled() || isRerankHangRemembered();
   const hooks = options?.hooks;
 
   const collections = options?.collections;

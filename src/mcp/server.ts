@@ -38,7 +38,7 @@ import {
 import { getConfigPath, loadConfig } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
-import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, resolveModels } from "../llm.js";
+import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
 
@@ -53,13 +53,16 @@ import { checkBearer } from "./auth.js";
  * remotely the daemon keeps serving unreranked results; killing it would only
  * repeat the hang on the next query. A local embed or generate model is refused
  * by the poisoned instance, so then the process is killed (exit() would block on
- * the stuck native thread) and a supervisor, if any, restarts the server.
+ * the stuck native thread) and a supervisor, if any, restarts the server. The
+ * kill leaves a marker (recordRerankHang) so the restarted process skips rerank
+ * and the daemon restarts at most once per hour for a hanging reranker.
  */
 let rerankHangLogged = false;
 export function exitIfRerankHung(store?: QMDStore): void {
   if (!isLlamaPoisoned()) return;
   if (localModelsNeedNative(store)) {
     console.error("QMD: rerank (or its model load) timed out; served unreranked results and killing the process (restart the server)");
+    recordRerankHang();
     setTimeout(() => killProcessNow(), 1000);
     return;
   }

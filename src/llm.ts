@@ -391,6 +391,35 @@ export function killProcessNow(): never {
   // Not reached; SIGKILL cannot be handled.
   return process.exit(137);
 }
+
+const RERANK_HANG_MEMORY_MS = 60 * 60 * 1000;
+
+function rerankHangMarkerPath(): string {
+  return join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "qmd", "rerank-hung");
+}
+
+/**
+ * Leave a marker for the next process: a daemon killed after a hung rerank
+ * would otherwise hang again on its first query after the restart.
+ */
+export function recordRerankHang(): void {
+  try {
+    const path = rerankHangMarkerPath();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, String(Date.now()));
+  } catch { /* best effort: without the marker the restart just retries the rerank */ }
+}
+
+/** True when this process is poisoned, or a process was killed over a hung rerank within the last hour. */
+export function isRerankHangRemembered(): boolean {
+  if (llamaPoisoned) return true;
+  try {
+    return Date.now() - statSync(rerankHangMarkerPath()).mtimeMs < RERANK_HANG_MEMORY_MS;
+  } catch {
+    return false;
+  }
+}
+
 export function resetLlamaPoisonedForTests(): void {
   llamaPoisoned = false;
 }

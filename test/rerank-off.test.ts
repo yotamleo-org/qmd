@@ -6,6 +6,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as llmModule from "../src/llm.js";
@@ -23,6 +24,7 @@ import { exitIfRerankHung } from "../src/mcp/server.js";
 
 let testDir: string;
 let store: Store;
+let savedCacheHome: string | undefined;
 
 beforeAll(async () => {
   testDir = await mkdtemp(join(tmpdir(), "qmd-rerank-off-"));
@@ -35,11 +37,15 @@ afterAll(async () => {
 beforeEach(() => {
   store = createStore(join(testDir, `test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`));
   process.env.QMD_RERANK_TIMEOUT_MS = "50";
+  savedCacheHome = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = join(testDir, `cache-${Math.random().toString(36).slice(2)}`);
 });
 
 afterEach(() => {
   delete process.env.QMD_RERANK;
   delete process.env.QMD_RERANK_TIMEOUT_MS;
+  if (savedCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+  else process.env.XDG_CACHE_HOME = savedCacheHome;
   resetLlamaPoisonedForTests();
   vi.restoreAllMocks();
   store.close();
@@ -212,5 +218,64 @@ describe("hung rerank is remembered per process", () => {
 
   test("exitIfRerankHung still kills a daemon with a local embed model, which the poisoned instance refuses", () => {
     expect(armedKills("hf:example/embed/local.gguf", "openai:generate")).toBe(2);
+  });
+});
+
+describe("a daemon with local models restarts at most once for a hung rerank", () => {
+  const MODEL_ENV = ["QMD_CONFIG_DIR", "QMD_EMBED_MODEL", "QMD_GENERATE_MODEL"] as const;
+  const markerPath = () => join(process.env.XDG_CACHE_HOME!, "qmd", "rerank-hung");
+
+  /** Kills the poisoned local-model daemon once (kill timer mocked), then simulates the supervisor's restart. */
+  function hangAndRestart(): void {
+    const saved = MODEL_ENV.map(k => process.env[k]);
+    process.env.QMD_CONFIG_DIR = testDir;
+    process.env.QMD_EMBED_MODEL = "hf:example/embed/local.gguf";
+    process.env.QMD_GENERATE_MODEL = "openai:generate";
+    vi.spyOn(globalThis, "setTimeout").mockImplementation((() => 0) as any);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    llmModule.markLlamaPoisonedForTests();
+    try {
+      exitIfRerankHung();
+    } finally {
+      MODEL_ENV.forEach((k, i) => {
+        if (saved[i] === undefined) delete process.env[k];
+        else process.env[k] = saved[i];
+      });
+    }
+    vi.restoreAllMocks();
+    resetLlamaPoisonedForTests();
+  }
+
+  test("the restarted process serves unreranked instead of hanging and being killed again", async () => {
+    await insertDoc("a.md", "# A\n\nrestart keyword");
+    hangAndRestart();
+    const llm = hangingLlm();
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+
+    const results = await structuredSearch(store, [{ type: "lex", query: "restart keyword" }], {});
+
+    expect(results.length).toBe(1);
+    expect(llm.rerank).not.toHaveBeenCalled();
+  });
+
+  test("a hang recorded long ago is forgotten, so rerank is tried again", async () => {
+    await insertDoc("a.md", "# A\n\nstale keyword");
+    hangAndRestart();
+    expect(existsSync(markerPath())).toBe(true);
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(markerPath(), old, old);
+    const llm = hangingLlm();
+    vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(llm as any);
+
+    await structuredSearch(store, [{ type: "lex", query: "stale keyword" }], {});
+
+    expect(llm.rerank).toHaveBeenCalledTimes(1);
+  });
+
+  test("a daemon with remote models records no hang", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    llmModule.markLlamaPoisonedForTests();
+    exitIfRerankHung({ internal: { llm: { embedModelName: "openai:embed", generateModelName: "openai:generate" } } } as any);
+    expect(existsSync(markerPath())).toBe(false);
   });
 });
