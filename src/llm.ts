@@ -333,6 +333,12 @@ export function resolveRerankModel(config?: ModelResolutionConfig): string {
   return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
 }
 
+/** QMD_RERANK=off (also 0 or false) turns reranking off process-wide: the reranker is never loaded. */
+export function isRerankDisabled(): boolean {
+  const v = process.env.QMD_RERANK?.trim().toLowerCase();
+  return v === "off" || v === "0" || v === "false";
+}
+
 const DEFAULT_RERANK_TIMEOUT_MS = 60_000;
 const MAX_TIMER_MS = 2_147_483_647;
 
@@ -385,8 +391,57 @@ export function killProcessNow(): never {
   // Not reached; SIGKILL cannot be handled.
   return process.exit(137);
 }
+
+const RERANK_HANG_MEMORY_MS = 60 * 60 * 1000;
+const RERANK_HANG_CLOCK_SKEW_MS = 60 * 1000;
+
+function rerankHangMarkerPath(): string {
+  return join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "qmd", "rerank-hung");
+}
+
+/**
+ * Leave a marker for the next process: a daemon killed after a hung rerank
+ * would otherwise hang again on its first query after the restart.
+ */
+export function recordRerankHang(): void {
+  try {
+    const path = rerankHangMarkerPath();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, String(Date.now()));
+  } catch { /* best effort: without the marker the restart just retries the rerank */ }
+}
+
+function readRerankHangMarker(): number | undefined {
+  try {
+    return statSync(rerankHangMarkerPath()).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+// Read once at startup: only a process started after the kill skips rerank, not
+// a healthy process that happens to be running when another one is killed.
+let rerankHangSeenAtStartup = readRerankHangMarker();
+
+/** True when this process is poisoned, or it started within an hour after a process was killed over a hung rerank. */
+export function isRerankHangRemembered(): boolean {
+  if (llamaPoisoned) return true;
+  if (rerankHangSeenAtStartup === undefined) return false;
+  // A marker dated well in the future (clock stepped back, copied file) is not a recent hang;
+  // a minute of slack covers file timestamps running slightly ahead of Date.now() (seen on macOS).
+  const age = Date.now() - rerankHangSeenAtStartup;
+  return age > -RERANK_HANG_CLOCK_SKEW_MS && age < RERANK_HANG_MEMORY_MS;
+}
+
 export function resetLlamaPoisonedForTests(): void {
   llamaPoisoned = false;
+}
+export function markLlamaPoisonedForTests(): void {
+  llamaPoisoned = true;
+}
+/** Re-reads the hang marker as a freshly started process would. */
+export function restartForTests(): void {
+  rerankHangSeenAtStartup = readRerankHangMarker();
 }
 
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {

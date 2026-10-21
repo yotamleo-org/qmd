@@ -67,6 +67,9 @@ import {
   resolveRerankLoadTimeoutMs,
   RerankTimeoutError,
   RerankLoadTimeoutError,
+  isRerankDisabled,
+  isRerankHangRemembered,
+  isLlamaPoisoned,
   type RerankDocument,
   type ILLMSession,
   type LLM,
@@ -6413,7 +6416,7 @@ export async function hybridQuery(
   const filter = options?.filter;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled() || isRerankHangRemembered();
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -6637,7 +6640,8 @@ export async function hybridQuery(
   try {
     reranked = await store.rerank(query, chunksToRerank, undefined, intent);
   } catch (err) {
-    if (!(err instanceof RerankTimeoutError)) throw err;
+    // A concurrent search may have poisoned the process after the skip check above.
+    if (!(err instanceof RerankTimeoutError || isLlamaPoisoned())) throw err;
     // Fall back to the unreranked hybrid (RRF) order.
     rerankTimedOut = true;
     reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
@@ -6840,7 +6844,7 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled() || isRerankHangRemembered();
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -7043,7 +7047,8 @@ export async function structuredSearch(
   try {
     reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
   } catch (err) {
-    if (!(err instanceof RerankTimeoutError)) throw err;
+    // A concurrent search may have poisoned the process after the skip check above.
+    if (!(err instanceof RerankTimeoutError || isLlamaPoisoned())) throw err;
     // Fall back to the unreranked hybrid (RRF) order.
     rerankTimedOut = true;
     reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
