@@ -41,7 +41,7 @@ import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MOD
 import { decideLocalConfigGate, type SensitiveSnapshot } from "../trust.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
-import { isLlamaPoisoned, killProcessNow } from "../llm.js";
+import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
 
@@ -51,14 +51,43 @@ import { checkBearer } from "./auth.js";
 
 /**
  * A rerank that timed out leaves a native call spinning forever (it ignores
- * SIGTERM), so the process is unusable. Answer with the fallback results that
- * are already on their way, then kill the process (exit() would block on the
- * stuck native thread). A supervisor, if any, restarts the server.
+ * SIGTERM) and poisons the process, so searches skip rerank from then on (see
+ * hybridQuery/structuredSearch). With embedding and query expansion served
+ * remotely the daemon keeps serving unreranked results; killing it would only
+ * repeat the hang on the next query. A local embed or generate model is refused
+ * by the poisoned instance, so then the process is killed (exit() would block on
+ * the stuck native thread) and a supervisor, if any, restarts the server. The
+ * kill leaves a marker (recordRerankHang) so the restarted process skips rerank
+ * and the daemon restarts at most once per hour for a hanging reranker.
  */
-function exitIfRerankHung(): void {
+let rerankHangLogged = false;
+export function exitIfRerankHung(store?: QMDStore): void {
   if (!isLlamaPoisoned()) return;
-  console.error("QMD: rerank (or its model load) timed out; served unreranked results and killing the process (restart the server)");
-  setTimeout(() => killProcessNow(), 1000);
+  if (localModelsNeedNative(store)) {
+    console.error("QMD: rerank (or its model load) timed out; served unreranked results and killing the process (restart the server)");
+    recordRerankHang();
+    setTimeout(() => killProcessNow(), 1000);
+    return;
+  }
+  if (rerankHangLogged) return;
+  rerankHangLogged = true;
+  console.error("QMD: rerank (or its model load) timed out; serving unreranked results from now on (QMD_RERANK=off skips the reranker at startup)");
+}
+
+/**
+ * True when embedding or query expansion still runs on the local (poisoned) llama instance.
+ * The store's effective models win: createStore may replace the raw config's models with defaults.
+ */
+function localModelsNeedNative(store?: QMDStore): boolean {
+  const llm = store?.internal.llm;
+  if (llm) return !isOpenAiModelUri(llm.embedModelName) || !isOpenAiModelUri(llm.generateModelName);
+  let models: ReturnType<typeof resolveModels>;
+  try {
+    models = resolveModels(loadConfig().models);
+  } catch {
+    models = resolveModels();
+  }
+  return !isOpenAiModelUri(models.embed) || !isOpenAiModelUri(models.generate);
 }
 
 type SearchResultItem = {
@@ -148,7 +177,7 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
   }
   if (results.some(r => r.rerankTimedOut)) {
-    lines.push('\nNote: the reranker timed out; results are unreranked (RRF order) and the server is restarting.');
+    lines.push('\nNote: the reranker timed out; results are unreranked (RRF order).');
   }
   return lines.join('\n');
 }
@@ -645,7 +674,7 @@ Intent-aware lex (C++ performance, not sports):
         || searches?.[0]?.query
         || "";
 
-      exitIfRerankHung();
+      exitIfRerankHung(store);
 
       const filtered: SearchResultItem[] = results.map(r => {
         const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
@@ -2354,7 +2383,7 @@ export async function startMcpHttpServer(
 
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ results: formatted }));
-        exitIfRerankHung();
+        exitIfRerankHung(store);
         log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }
