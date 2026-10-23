@@ -326,7 +326,8 @@ def cmd_sft(args):
         save_total_limit=save_total_limit,
         eval_strategy="steps",
         eval_steps=cfg["training"].get("eval_steps", 200),
-        warmup_ratio=cfg["training"]["warmup_ratio"],
+        # transformers 5 dropped warmup_ratio; a float warmup_steps is the same ratio
+        warmup_steps=cfg["training"]["warmup_ratio"],
         lr_scheduler_type=cfg["training"]["lr_scheduler"],
         ddp_find_unused_parameters=cfg["training"].get(
             "ddp_find_unused_parameters", False
