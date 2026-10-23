@@ -1,4 +1,4 @@
 [test]
 # bun runs vi.mock factories eagerly, without importOriginal, and the swap leaks
 # into every other file. Vitest-only until the mock is removed (HIMMEL-5938).
-pathIgnorePatterns = ["test/mcp-query-burst.test.ts", "test/mcp-query-queue.test.ts"]
+pathIgnorePatterns = ["test/mcp-query-burst.test.ts", "test/mcp-query-queue.test.ts", "test/mcp-query-task.test.ts"]

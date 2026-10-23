@@ -41,6 +41,7 @@ import { enableProductionMode } from "../store.js";
 import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
+import { getTask, TASKS_EXTENSION, withTask } from "./tasks.js";
 
 // =============================================================================
 // Types for structured content
@@ -407,6 +408,7 @@ async function createMcpServer(store: QMDStore, inflight?: InflightGate): Promis
     { name: "qmd", version: getPackageVersion() },
     {
       instructions: await getInstructions(store),
+      capabilities: { extensions: { [TASKS_EXTENSION]: {} } },
       // tools/list is static for the process lifetime; resources/read stays
       // uncacheable because the index can change under us.
       cacheHints: {
@@ -579,7 +581,7 @@ Intent-aware lex (C++ performance, not sports):
         ),
       }),
     },
-    track(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }, extra) => {
+    track(withTask(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }, extra) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -688,8 +690,11 @@ Intent-aware lex (C++ performance, not sports):
         content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
         structuredContent: { results: filtered },
       };
-    })
+    }, track))
   );
+
+  // The extension's status poll; tasks created by any server instance answer here.
+  server.server.setRequestHandler("tasks/get", { params: z.object({ taskId: z.string() }) }, ({ taskId }) => getTask(taskId));
 
   // ---------------------------------------------------------------------------
   // Tool: qmd_get (Retrieve document)
