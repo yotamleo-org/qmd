@@ -54,7 +54,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # 1.4.3 is the last version where the SQLite-budget tests pass; HIMMEL-7197 tracks 1.4.4.
+          bun-version: 1.4.3
 
       - name: Install SQLite (Ubuntu)
         if: runner.os == 'Linux'
