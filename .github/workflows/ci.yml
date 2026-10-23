@@ -54,7 +54,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          # Memory-budget tests assert peak RSS, so CI pins 1.4.4.
+          # Memory-budget tests assert peak RSS, so CI pins 1.4.4 (it also passes the
+          # SQLite-budget tests HIMMEL-7197 had pinned 1.4.3 for).
           bun-version: "1.4.4"
 
       - name: Install SQLite (Ubuntu)
