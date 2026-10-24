@@ -41,7 +41,7 @@ import { enableProductionMode } from "../store.js";
 import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
-import { getTask, TASKS_EXTENSION, withTask } from "./tasks.js";
+import { cancelTask, getTask, TASKS_EXTENSION, withTask } from "./tasks.js";
 
 // =============================================================================
 // Types for structured content
@@ -693,8 +693,10 @@ Intent-aware lex (C++ performance, not sports):
     }, track))
   );
 
-  // The extension's status poll; tasks created by any server instance answer here.
-  server.server.setRequestHandler("tasks/get", { params: z.object({ taskId: z.string() }) }, ({ taskId }) => getTask(taskId));
+  // The extension's status poll and cancel; tasks created by any server instance answer here.
+  const taskIdParams = { params: z.object({ taskId: z.string() }) };
+  server.server.setRequestHandler("tasks/get", taskIdParams, ({ taskId }, ctx) => getTask(taskId, ctx));
+  server.server.setRequestHandler("tasks/cancel", taskIdParams, ({ taskId }, ctx) => cancelTask(taskId, ctx));
 
   // ---------------------------------------------------------------------------
   // Tool: qmd_get (Retrieve document)

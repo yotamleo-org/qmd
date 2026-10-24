@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -34,7 +34,7 @@ function envelope(withTasks: boolean) {
   };
 }
 
-type Rpc = { result?: Record<string, any>; error?: { code: number; message: string } };
+type Rpc = { result?: Record<string, any>; error?: { code: number; message: string; data?: Record<string, any> } };
 
 const queryArgs = { searches: [{ type: "lex", query: "alpha" }] };
 
@@ -76,7 +76,7 @@ describe("query tool as an MCP task — HTTP", () => {
         "Content-Type": "application/json", Accept: "application/json, text/event-stream",
         "MCP-Protocol-Version": "2026-07-28", "Mcp-Method": method,
         ...(method === "tools/call" ? { "Mcp-Name": "query" } : {}),
-        ...(method === "tasks/get" ? { "Mcp-Name": String(params.taskId) } : {}),
+        ...(method === "tasks/get" || method === "tasks/cancel" ? { "Mcp-Name": String(params.taskId) } : {}),
       },
       body: JSON.stringify({ jsonrpc: "2.0", id, method, params: { ...params, _meta: envelope(withTasks) } }),
     });
@@ -124,21 +124,56 @@ describe("query tool as an MCP task — HTTP", () => {
     expect(done.result?.result.content).toEqual(sync.result?.content);
   });
 
-  test("a search that throws ends the task failed with the message", async () => {
+  test("a search that throws ends the task completed with the same error result as a synchronous call", async () => {
+    const ok = searchStub.fn;
     searchStub.fn = async () => { throw new Error("rerank exploded"); };
-    const created = await rpc("tools/call", { name: "query", arguments: queryArgs }, true);
-    expect(created.result?.resultType).toBe("task");
-    let done: Rpc = created;
-    await vi.waitFor(async () => {
-      done = await rpc("tasks/get", { taskId: created.result!.taskId }, true);
-      expect(done.result?.status).toBe("failed");
-    }, { timeout: 5000 });
-    expect(done.result?.error.message).toContain("rerank exploded");
+    try {
+      const sync = await rpc("tools/call", { name: "query", arguments: queryArgs }, false);
+      expect(sync.result?.isError).toBe(true);
+      const created = await rpc("tools/call", { name: "query", arguments: queryArgs }, true);
+      expect(created.result?.resultType).toBe("task");
+      let done: Rpc = created;
+      await vi.waitFor(async () => {
+        done = await rpc("tasks/get", { taskId: created.result!.taskId }, true);
+        expect(done.result?.status).toBe("completed");
+      }, { timeout: 5000 });
+      expect(done.result?.result.isError).toBe(true);
+      expect(done.result?.result.content).toEqual(sync.result?.content);
+      expect(done.result?.result.content[0].text).toContain("rerank exploded");
+    } finally {
+      searchStub.fn = ok;
+    }
   });
 
-  test("an unknown task id is an invalid-params error", async () => {
-    const res = await rpc("tasks/get", { taskId: "nope" }, true);
-    expect(res.error?.code).toBe(-32602);
+  test("an unknown task id is an invalid-params error for get and cancel", async () => {
+    expect((await rpc("tasks/get", { taskId: "nope" }, true)).error?.code).toBe(-32602);
+    expect((await rpc("tasks/cancel", { taskId: "nope" }, true)).error?.code).toBe(-32602);
+  });
+
+  test("tasks/get and tasks/cancel refuse a client that did not declare the extension", async () => {
+    open();
+    const created = await rpc("tools/call", { name: "query", arguments: queryArgs }, true);
+    const taskId = created.result!.taskId;
+    for (const method of ["tasks/get", "tasks/cancel"]) {
+      const res = await rpc(method, { taskId }, false);
+      expect(res.error?.code).toBe(-32021);
+      expect(res.error?.data?.requiredCapabilities).toEqual({ extensions: { [TASKS_EXT]: {} } });
+    }
+    release();
+  });
+
+  test("tasks/cancel acks with an empty result and the task stays cancelled when the search finishes", async () => {
+    open();
+    const created = await rpc("tools/call", { name: "query", arguments: queryArgs }, true);
+    const taskId = created.result!.taskId;
+    const ack = await rpc("tasks/cancel", { taskId }, true);
+    expect(ack.error).toBeUndefined();
+    expect(ack.result?.resultType).toBe("complete");
+    release();
+    await new Promise(r => setTimeout(r, 100));
+    const after = await rpc("tasks/get", { taskId }, true);
+    expect(after.result?.status).toBe("cancelled");
+    expect(after.result?.result).toBeUndefined();
   });
 });
 
@@ -150,7 +185,10 @@ describe("query tool as an MCP task — stdio", () => {
   let buffer = "";
   const waiting = new Map<number, (m: Rpc) => void>();
 
-  beforeAll(async () => {
+  // A fresh process per test: an initialize after stateless 2026 requests is not a clean 2025 session.
+  beforeEach(async () => {
+    buffer = "";
+    waiting.clear();
     workDir = await mkdtemp(join(tmpdir(), "qmd-task-stdio-"));
     await writeFile(join(workDir, "index.yml"), "collections: {}\n");
     const runtimeArgs = process.versions.bun ? [cliPath, "mcp"] : ["--import", "tsx", cliPath, "mcp"];
@@ -171,18 +209,20 @@ describe("query tool as an MCP task — stdio", () => {
       }
     });
   });
-  afterAll(async () => {
+  afterEach(async () => {
     server.kill("SIGKILL");
     await rm(workDir, { recursive: true, force: true });
   });
 
   let nextId = 1;
-  function rpc(method: string, params: Record<string, unknown>, withTasks: boolean): Promise<Rpc> {
+  // withTasks null sends no envelope, as a pre-2026 client does.
+  function rpc(method: string, params: Record<string, unknown>, withTasks: boolean | null): Promise<Rpc> {
     const id = nextId++;
     return new Promise<Rpc>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`no reply to ${method}`)), 45_000);
       waiting.set(id, (m) => { clearTimeout(timer); resolve(m); });
-      server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: { ...params, _meta: envelope(withTasks) } }) + "\n");
+      const body = withTasks === null ? params : { ...params, _meta: envelope(withTasks) };
+      server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: body }) + "\n");
     });
   }
 
@@ -200,5 +240,16 @@ describe("query tool as an MCP task — stdio", () => {
     }, { timeout: 30_000 });
     expect(done.result?.result.structuredContent).toEqual(sync.result?.structuredContent);
     expect(done.result?.result.content).toEqual(sync.result?.content);
+  }, 60_000);
+
+  test("a 2025-era initialize session gets the synchronous result", async () => {
+    const init = await rpc("initialize", {
+      protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "legacy", version: "1.0.0" },
+    }, null);
+    expect(init.result?.protocolVersion).toBe("2025-06-18");
+    const res = await rpc("tools/call", { name: "query", arguments: queryArgs }, null);
+    expect(res.result?.taskId).toBeUndefined();
+    expect(res.result?.resultType).not.toBe("task");
+    expect(res.result?.structuredContent).toEqual({ results: [] });
   }, 60_000);
 });

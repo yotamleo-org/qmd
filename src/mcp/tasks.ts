@@ -9,23 +9,30 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { CLIENT_CAPABILITIES_META_KEY, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
+import {
+  CLIENT_CAPABILITIES_META_KEY,
+  MissingRequiredClientCapabilityError,
+  ProtocolError,
+  ProtocolErrorCode,
+} from "@modelcontextprotocol/server";
 
 export const TASKS_EXTENSION = "io.modelcontextprotocol/tasks";
 
 const POLL_INTERVAL_MS = 2000;
 // How long a finished task stays readable after its last update.
-const TASK_TTL_MS = 60 * 60 * 1000;
+export const TASK_TTL_MS = 60 * 60 * 1000;
+// Tasks held at once (running or finished and not yet swept); new ones are refused above it.
+export const MAX_TASKS = 100;
 
-type TaskStatus = "working" | "completed" | "failed";
+type TaskStatus = "working" | "completed" | "cancelled";
 
 type TaskRecord = {
   taskId: string;
   status: TaskStatus;
   createdAt: string;
   lastUpdatedAt: string;
+  abort: AbortController;
   result?: unknown;
-  error?: { code: number; message: string };
 };
 
 const tasks = new Map<string, TaskRecord>();
@@ -37,6 +44,8 @@ function sweep(now: number): void {
 }
 
 function settle(task: TaskRecord, patch: Pick<TaskRecord, "status"> & Partial<TaskRecord>): void {
+  // A cancel that landed first stays; the run's late result is dropped.
+  if (task.status === "cancelled") return;
   Object.assign(task, patch, { lastUpdatedAt: new Date().toISOString() });
 }
 
@@ -48,10 +57,16 @@ export function clientWantsTask(ctx: ToolCallContext | undefined): boolean {
   return caps?.extensions?.[TASKS_EXTENSION] !== undefined;
 }
 
+function errorResult(message: string) {
+  return { content: [{ type: "text" as const, text: message }], isError: true };
+}
+
 /**
  * Wrap a tool handler: with the extension the handler runs in the background
  * and the call answers `resultType: "task"`; without it the handler runs as-is.
- * `track` keeps the background run visible to the stdio EOF shutdown.
+ * A handler that throws ends the task `completed` with the same error result
+ * the SDK gives a synchronous call. `track` keeps the background run visible to
+ * the stdio EOF shutdown.
  */
 export function withTask<A, C extends ToolCallContext, R>(
   handler: (args: A, ctx: C) => Promise<R>,
@@ -59,17 +74,21 @@ export function withTask<A, C extends ToolCallContext, R>(
 ): (args: A, ctx: C) => Promise<R> {
   return async (args, ctx) => {
     if (!clientWantsTask(ctx)) return handler(args, ctx);
-    const now = new Date().toISOString();
     sweep(Date.now());
-    const task: TaskRecord = { taskId: randomUUID(), status: "working", createdAt: now, lastUpdatedAt: now };
+    if (tasks.size >= MAX_TASKS) {
+      const refused = errorResult(`Busy: ${tasks.size} tasks are already held. Retry shortly.`);
+      return refused as R;
+    }
+    const now = new Date().toISOString();
+    const task: TaskRecord = { taskId: randomUUID(), status: "working", createdAt: now, lastUpdatedAt: now, abort: new AbortController() };
     tasks.set(task.taskId, task);
     // The HTTP request that created the task ends at once, so its abort signal must not reach the background run.
-    const detached = { ...ctx, mcpReq: { ...(ctx as { mcpReq?: object }).mcpReq, signal: new AbortController().signal } } as C;
+    const detached = { ...ctx, mcpReq: { ...(ctx as { mcpReq?: object }).mcpReq, signal: task.abort.signal } } as C;
     void track(async () => {
       try {
         settle(task, { status: "completed", result: await handler(args, detached) });
       } catch (err) {
-        settle(task, { status: "failed", error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
+        settle(task, { status: "completed", result: errorResult(err instanceof Error ? err.message : String(err)) });
       }
     })();
     // The SDK passes a non-"complete" resultType through for tools/call untouched.
@@ -89,14 +108,29 @@ function view(task: TaskRecord): Record<string, unknown> {
   };
 }
 
-/** The `tasks/get` result for a task id; the SDK stamps `resultType: "complete"` on it. */
-export function getTask(taskId: string): Record<string, unknown> {
+// The task methods are for clients that declared the extension; others get -32021.
+function lookup(taskId: string, ctx: ToolCallContext): TaskRecord {
+  if (!clientWantsTask(ctx)) {
+    throw new MissingRequiredClientCapabilityError({ requiredCapabilities: { extensions: { [TASKS_EXTENSION]: {} } } });
+  }
   sweep(Date.now());
   const task = tasks.get(taskId);
   if (!task) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown task: ${taskId}`);
-  return {
-    ...view(task),
-    ...(task.status === "completed" ? { result: task.result } : {}),
-    ...(task.status === "failed" ? { error: task.error } : {}),
-  };
+  return task;
+}
+
+/** The `tasks/get` result for a task id; the SDK stamps `resultType: "complete"` on it. */
+export function getTask(taskId: string, ctx: ToolCallContext): Record<string, unknown> {
+  const task = lookup(taskId, ctx);
+  return { ...view(task), ...(task.status === "completed" ? { result: task.result } : {}) };
+}
+
+/** `tasks/cancel`: ack with an empty result and stop a running task; a finished one keeps its outcome. */
+export function cancelTask(taskId: string, ctx: ToolCallContext): Record<string, never> {
+  const task = lookup(taskId, ctx);
+  if (task.status === "working") {
+    settle(task, { status: "cancelled" });
+    task.abort.abort();
+  }
+  return {};
 }
