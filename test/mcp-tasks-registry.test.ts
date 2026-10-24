@@ -9,14 +9,20 @@ const ok = { content: [{ type: "text" as const, text: "done" }] };
 type Created = { taskId?: string; resultType?: string; isError?: boolean; content?: { text: string }[] };
 const start = (run: () => Promise<unknown>): Promise<Created> => withTask<object, typeof ctx, Created>(async () => (await run()) as Created, track)({}, ctx);
 
+// bun's vitest shim has no vi.waitFor
+async function completed(taskId: string): Promise<void> {
+  for (let i = 0; i < 200 && getTask(taskId, ctx).status !== "completed"; i++) await new Promise(r => setTimeout(r, 10));
+  expect(getTask(taskId, ctx).status).toBe("completed");
+}
+
 describe("task registry", () => {
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => vi.restoreAllMocks());
 
   test("a finished task is swept once its ttl has passed", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
     const created = await start(async () => ok);
-    await vi.waitFor(() => expect(getTask(created.taskId!, ctx).status).toBe("completed"));
-    vi.setSystemTime(Date.now() + TASK_TTL_MS + 1000);
+    await completed(created.taskId!);
+    const later = Date.now() + TASK_TTL_MS + 1000;
+    vi.spyOn(Date, "now").mockReturnValue(later);
     expect(() => getTask(created.taskId!, ctx)).toThrow(/Unknown task/);
   });
 
@@ -30,6 +36,6 @@ describe("task registry", () => {
     expect(refused.taskId).toBeUndefined();
     expect(refused.content?.[0].text).toContain("Busy");
     free();
-    await vi.waitFor(() => expect(getTask(held[0].taskId!, ctx).status).toBe("completed"));
+    await completed(held[0].taskId!);
   });
 });
