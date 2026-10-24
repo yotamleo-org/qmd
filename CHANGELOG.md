@@ -20,6 +20,11 @@ Carried on top of tobi/qmd main (HIMMEL-5952 resync):
   (HIMMEL-5887).
 - Plain-text `query` bursts are admission-gated, and typed vec searches are
   capped and serialized (HIMMEL-5891).
+- MCP `query` returns a task (`resultType: "task"`) when the request declares
+  the `io.modelcontextprotocol/tasks` extension, `tasks/get` reports its
+  status and result and `tasks/cancel` stops it; past 100 live task handlers a call
+  runs synchronously; other clients get the unchanged synchronous result
+  (HIMMEL-7302).
 
 ### Fixed
 
