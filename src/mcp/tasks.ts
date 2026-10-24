@@ -21,7 +21,7 @@ export const TASKS_EXTENSION = "io.modelcontextprotocol/tasks";
 const POLL_INTERVAL_MS = 2000;
 // How long a finished task stays readable after its last update.
 export const TASK_TTL_MS = 60 * 60 * 1000;
-// Tasks held at once (running or finished and not yet swept); new ones are refused above it.
+// Tasks running at once; above it a call runs synchronously instead of becoming a task.
 export const MAX_TASKS = 100;
 
 type TaskStatus = "working" | "completed" | "cancelled";
@@ -41,6 +41,12 @@ function sweep(now: number): void {
   for (const [id, t] of tasks) {
     if (t.status !== "working" && now - Date.parse(t.lastUpdatedAt) > TASK_TTL_MS) tasks.delete(id);
   }
+}
+
+function runningCount(): number {
+  let n = 0;
+  for (const t of tasks.values()) if (t.status === "working") n++;
+  return n;
 }
 
 function settle(task: TaskRecord, patch: Pick<TaskRecord, "status"> & Partial<TaskRecord>): void {
@@ -75,10 +81,8 @@ export function withTask<A, C extends ToolCallContext, R>(
   return async (args, ctx) => {
     if (!clientWantsTask(ctx)) return handler(args, ctx);
     sweep(Date.now());
-    if (tasks.size >= MAX_TASKS) {
-      const refused = errorResult(`Busy: ${tasks.size} tasks are already held. Retry shortly.`);
-      return refused as R;
-    }
+    // At the cap of running tasks the call just runs synchronously, as for a client without the extension.
+    if (runningCount() >= MAX_TASKS) return handler(args, ctx);
     const now = new Date().toISOString();
     const task: TaskRecord = { taskId: randomUUID(), status: "working", createdAt: now, lastUpdatedAt: now, abort: new AbortController() };
     tasks.set(task.taskId, task);

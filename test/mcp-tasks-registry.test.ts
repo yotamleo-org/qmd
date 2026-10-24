@@ -1,5 +1,5 @@
 import { describe, test, expect, afterEach, vi } from "vitest";
-import { MAX_TASKS, TASKS_EXTENSION, TASK_TTL_MS, getTask, withTask } from "../src/mcp/tasks.ts";
+import { MAX_TASKS, TASKS_EXTENSION, TASK_TTL_MS, cancelTask, getTask, withTask } from "../src/mcp/tasks.ts";
 import { CLIENT_CAPABILITIES_META_KEY } from "@modelcontextprotocol/server";
 
 const ctx = { mcpReq: { envelope: { [CLIENT_CAPABILITIES_META_KEY]: { extensions: { [TASKS_EXTENSION]: {} } } } } };
@@ -26,16 +26,35 @@ describe("task registry", () => {
     expect(() => getTask(created.taskId!, ctx)).toThrow(/Unknown task/);
   });
 
-  test("above the cap a new task is refused with an error result", async () => {
+  test("finished tasks do not count toward the cap", async () => {
+    for (let i = 0; i < MAX_TASKS; i++) {
+      const done = await start(async () => ok);
+      await completed(done.taskId!);
+    }
+    const next = await start(async () => ok);
+    expect(next.resultType).toBe("task");
+  });
+
+  test("at the cap of running tasks a new call runs synchronously instead of becoming a task", async () => {
     let free!: () => void;
     const hold = new Promise<void>(r => { free = r; });
     const held: Created[] = [];
     for (let i = 0; i < MAX_TASKS; i++) held.push(await start(() => hold));
-    const refused = await start(async () => ok);
-    expect(refused.isError).toBe(true);
-    expect(refused.taskId).toBeUndefined();
-    expect(refused.content?.[0].text).toContain("Busy");
+    const sync = await start(async () => ok);
+    expect(sync).toEqual(ok);
     free();
     await completed(held[0].taskId!);
+  });
+
+  test("tasks/cancel aborts the signal the running handler holds", async () => {
+    let seen: AbortSignal | undefined;
+    const created = await withTask<object, typeof ctx, Created>(async (_a, c) => {
+      seen = (c as { mcpReq?: { signal?: AbortSignal } }).mcpReq?.signal;
+      await new Promise(r => setTimeout(r, 20));
+      return ok as Created;
+    }, track)({}, ctx);
+    await new Promise(r => setTimeout(r, 5));
+    cancelTask(created.taskId!, ctx);
+    expect(seen?.aborted).toBe(true);
   });
 });
