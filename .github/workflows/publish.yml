@@ -10,14 +10,14 @@ jobs:
 
     permissions:
       contents: write
-      id-token: write
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # keep equal to the bun-version in ci.yml (test/publish-workflow.test.ts enforces it)
+          bun-version: 1.4.3
 
       - name: Install SQLite
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -29,15 +29,6 @@ jobs:
         env:
           CI: true
           LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false
-
-      - run: npm run build
-      - run: npm publish --provenance --access public
 
       - name: Extract release notes
         id: notes
