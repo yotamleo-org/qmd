@@ -46,6 +46,20 @@ describe("task registry", () => {
     await completed(held[0].taskId!);
   });
 
+  test("a cancelled task still holds its slot until its handler settles", async () => {
+    let free!: () => void;
+    const hold = new Promise<void>(r => { free = r; });
+    const held: Created[] = [];
+    for (let i = 0; i < MAX_TASKS; i++) held.push(await start(() => hold));
+    cancelTask(held[0].taskId!, ctx);
+    const sync = await start(async () => ok);
+    expect(sync).toEqual(ok);
+    free();
+    await new Promise(r => setTimeout(r, 20));
+    const next = await start(async () => ok);
+    expect(next.resultType).toBe("task");
+  });
+
   test("tasks/cancel aborts the signal the running handler holds", async () => {
     let seen: AbortSignal | undefined;
     const created = await withTask<object, typeof ctx, Created>(async (_a, c) => {

@@ -21,7 +21,7 @@ export const TASKS_EXTENSION = "io.modelcontextprotocol/tasks";
 const POLL_INTERVAL_MS = 2000;
 // How long a finished task stays readable after its last update.
 export const TASK_TTL_MS = 60 * 60 * 1000;
-// Tasks running at once; above it a call runs synchronously instead of becoming a task.
+// Handlers running at once; above it a call runs synchronously instead of becoming a task.
 export const MAX_TASKS = 100;
 
 type TaskStatus = "working" | "completed" | "cancelled";
@@ -43,11 +43,8 @@ function sweep(now: number): void {
   }
 }
 
-function runningCount(): number {
-  let n = 0;
-  for (const t of tasks.values()) if (t.status === "working") n++;
-  return n;
-}
+// Handlers still executing. A cancelled task keeps its slot until its handler settles, since the search it started is still running.
+let liveHandlers = 0;
 
 function settle(task: TaskRecord, patch: Pick<TaskRecord, "status"> & Partial<TaskRecord>): void {
   // A cancel that landed first stays; the run's late result is dropped.
@@ -81,18 +78,21 @@ export function withTask<A, C extends ToolCallContext, R>(
   return async (args, ctx) => {
     if (!clientWantsTask(ctx)) return handler(args, ctx);
     sweep(Date.now());
-    // At the cap of running tasks the call just runs synchronously, as for a client without the extension.
-    if (runningCount() >= MAX_TASKS) return handler(args, ctx);
+    // At the cap of live handlers the call just runs synchronously, as for a client without the extension.
+    if (liveHandlers >= MAX_TASKS) return handler(args, ctx);
     const now = new Date().toISOString();
     const task: TaskRecord = { taskId: randomUUID(), status: "working", createdAt: now, lastUpdatedAt: now, abort: new AbortController() };
     tasks.set(task.taskId, task);
     // The HTTP request that created the task ends at once, so its abort signal must not reach the background run.
     const detached = { ...ctx, mcpReq: { ...(ctx as { mcpReq?: object }).mcpReq, signal: task.abort.signal } } as C;
+    liveHandlers++;
     void track(async () => {
       try {
         settle(task, { status: "completed", result: await handler(args, detached) });
       } catch (err) {
         settle(task, { status: "completed", result: errorResult(err instanceof Error ? err.message : String(err)) });
+      } finally {
+        liveHandlers--;
       }
     })();
     // The SDK passes a non-"complete" resultType through for tools/call untouched.
