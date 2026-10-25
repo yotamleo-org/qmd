@@ -44,6 +44,7 @@ describe("OpenAiLLM remote embed tuning", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     process.env = { ...savedEnv };
   });
 
@@ -111,5 +112,39 @@ describe("OpenAiLLM remote embed tuning", () => {
     const calls = stubFetch(echo);
     await new OpenAiLLM({ ...config, baseUrl: "https://openrouter.ai/api/v1" }).embedBatch(["a"]);
     expect(calls[0]!.body.provider).toBeUndefined();
+  });
+
+  test("a 503 from the pinned provider is retried on the same pin (no fallback); the failed status and the serving provider are logged", async () => {
+    process.env.QMD_OPENAI_PROVIDER = "DeepInfra";
+    const logged: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => { logged.push(args.join(" ")); });
+    let attempts = 0;
+    const calls = stubFetch(call => {
+      attempts++;
+      if (attempts === 1) return new Response("upstream down", { status: 503 });
+      return { provider: "DeepInfra", ...echo(call) };
+    });
+    const results = await new OpenAiLLM({ ...config, baseUrl: "https://openrouter.ai/api/v1" }).embedBatch(["abc"]);
+    expect(results[0]?.embedding[0]).toBe(3);
+    expect(calls).toHaveLength(2);
+    // Cross-provider vectors differ (DeepInfra vs Nebius/SiliconFlow cosine 0.9965 < 0.999), so the pin never falls back.
+    for (const call of calls) expect(call.body.provider).toEqual({ order: ["DeepInfra"], allow_fallbacks: false });
+    expect(logged).toContain("embed: request failed status=503 provider=DeepInfra");
+    expect(logged).toContain("embed: served by provider=DeepInfra");
+  });
+
+  test("the serving provider is logged on the first batch and again only when it changes", async () => {
+    process.env.QMD_OPENAI_EMBED_BATCH_SIZE = "1";
+    process.env.QMD_OPENAI_EMBED_CONCURRENCY = "1";
+    const logged: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => { logged.push(args.join(" ")); });
+    const served = ["DeepInfra", "DeepInfra", "Nebius"];
+    let n = 0;
+    stubFetch(call => ({ provider: served[n++], ...echo(call) }));
+    await new OpenAiLLM(config).embedBatch(["a", "b", "c"]);
+    expect(logged.filter(l => l.startsWith("embed: served by"))).toEqual([
+      "embed: served by provider=DeepInfra",
+      "embed: served by provider=Nebius",
+    ]);
   });
 });
