@@ -2316,7 +2316,8 @@ export class OpenAiLLM implements LLM {
               ...pin,
             });
           } catch (error) {
-            const status = error instanceof HttpStatusError ? error.status : 0;
+            // 0 = no answer (network error, timeout); a 200 whose body is not JSON did answer.
+            const status = error instanceof HttpStatusError ? error.status : error instanceof SyntaxError ? "invalid-json" : 0;
             console.error(`embed: request failed status=${status} provider=${"provider" in pin ? provider : "unpinned"}`);
             throw error;
           }

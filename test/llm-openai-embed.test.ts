@@ -134,6 +134,16 @@ describe("OpenAiLLM remote embed tuning", () => {
     for (const line of logged) expect(line).not.toContain(config.apiKey);
   });
 
+  test("a 200 whose body is not JSON is logged as status=invalid-json, not status=0, and is not retried", async () => {
+    process.env.QMD_OPENAI_PROVIDER = "DeepInfra";
+    const logged: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => { logged.push(args.join(" ")); });
+    const calls = stubFetch(() => new Response("<html>gateway</html>", { status: 200 }));
+    await expect(new OpenAiLLM({ ...config, baseUrl: "https://openrouter.ai/api/v1" }).embedBatch(["a"])).rejects.toThrow();
+    expect(calls).toHaveLength(1);
+    expect(logged).toEqual(["embed: request failed status=invalid-json provider=DeepInfra"]);
+  });
+
   test("the serving provider is logged on the first batch and again only when it changes", async () => {
     process.env.QMD_OPENAI_EMBED_BATCH_SIZE = "1";
     process.env.QMD_OPENAI_EMBED_CONCURRENCY = "1";
