@@ -131,6 +131,7 @@ describe("OpenAiLLM remote embed tuning", () => {
     for (const call of calls) expect(call.body.provider).toEqual({ order: ["DeepInfra"], allow_fallbacks: false });
     expect(logged).toContain("embed: request failed status=503 provider=DeepInfra");
     expect(logged).toContain("embed: served by provider=DeepInfra");
+    for (const line of logged) expect(line).not.toContain(config.apiKey);
   });
 
   test("the serving provider is logged on the first batch and again only when it changes", async () => {
@@ -146,5 +147,23 @@ describe("OpenAiLLM remote embed tuning", () => {
       "embed: served by provider=DeepInfra",
       "embed: served by provider=Nebius",
     ]);
+  });
+
+  test("separate embedBatch calls on one instance log the serving provider once, then again after it changes; queries log none", async () => {
+    const logged: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => { logged.push(args.join(" ")); });
+    const served = ["DeepInfra", "DeepInfra", "DeepInfra", "Nebius"];
+    let n = 0;
+    stubFetch(call => ({ provider: served[n++], ...echo(call) }));
+    const llm = new OpenAiLLM(config);
+    await llm.embedBatch(["a"]);
+    await llm.embedBatch(["a"]);
+    await llm.embedBatch(["a"], { isQuery: true });
+    await llm.embedBatch(["a"]);
+    expect(logged.filter(l => l.startsWith("embed: served by"))).toEqual([
+      "embed: served by provider=DeepInfra",
+      "embed: served by provider=Nebius",
+    ]);
+    for (const line of logged) expect(line).not.toContain(config.apiKey);
   });
 });

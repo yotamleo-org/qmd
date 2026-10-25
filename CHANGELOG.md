@@ -25,8 +25,9 @@ Carried on top of tobi/qmd main (HIMMEL-5952 resync):
   status and result and `tasks/cancel` stops it; past 100 live task handlers a call
   runs synchronously; other clients get the unchanged synchronous result
   (HIMMEL-7302).
-- A remote embed logs the OpenRouter provider that served its batches and the
-  HTTP status of every failed attempt; the provider pin keeps
+- A remote embed logs the OpenRouter provider that served it (once per
+  instance, again only when it changes; never for queries) and the HTTP
+  status of every failed attempt; the provider pin keeps
   `allow_fallbacks: false` because vectors differ across providers
   (HIMMEL-7593).
 

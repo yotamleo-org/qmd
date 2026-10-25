@@ -2205,6 +2205,8 @@ export class OpenAiLLM implements LLM {
   private readonly embedModelUri: string;
   private readonly generateModelUri: string;
   private readonly rerankModelUri: string;
+  // Per instance, not per embedBatch call: the store issues one call per HTTP request.
+  private lastServedBy?: string;
 
   constructor(config: OpenAiLLMConfig = {}) {
     const baseUrl = resolveOpenAiBaseUrl(config.baseUrl);
@@ -2299,7 +2301,6 @@ export class OpenAiLLM implements LLM {
     // Provider vectors differ across OpenRouter providers (cosine ~0.9965 between
     // DeepInfra and Nebius), so a stalled pin is retried, never swapped. What an
     // operator needs to see is which provider answered and which attempts failed.
-    let lastServedBy: string | undefined;
     let nextBatch = 0;
     const worker = async () => {
       while (nextBatch < batchCount) {
@@ -2320,8 +2321,8 @@ export class OpenAiLLM implements LLM {
             throw error;
           }
         }, { onRetry: status => options.onThrottle?.(status) });
-        if (data.provider && data.provider !== lastServedBy) {
-          lastServedBy = data.provider;
+        if (data.provider && !options.isQuery && data.provider !== this.lastServedBy) {
+          this.lastServedBy = data.provider;
           console.error(`embed: served by provider=${data.provider}`);
         }
         for (const item of data.data) {
