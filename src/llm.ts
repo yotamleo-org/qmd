@@ -2205,6 +2205,8 @@ export class OpenAiLLM implements LLM {
   private readonly embedModelUri: string;
   private readonly generateModelUri: string;
   private readonly rerankModelUri: string;
+  // Per instance, not per embedBatch call: the store issues one call per HTTP request.
+  private lastServedBy?: string;
 
   constructor(config: OpenAiLLMConfig = {}) {
     const baseUrl = resolveOpenAiBaseUrl(config.baseUrl);
@@ -2296,18 +2298,34 @@ export class OpenAiLLM implements LLM {
     const pin = provider && !options.isQuery && isOpenRouterEndpoint(this.baseUrl)
       ? { provider: { order: [provider], allow_fallbacks: false } }
       : {};
+    // Provider vectors differ across OpenRouter providers (cosine ~0.9965 between
+    // DeepInfra and Nebius), so a stalled pin is retried, never swapped. What an
+    // operator needs to see is which provider answered and which attempts failed.
     let nextBatch = 0;
     const worker = async () => {
       while (nextBatch < batchCount) {
         const offset = nextBatch++ * batchSize;
         const input = texts.slice(offset, offset + batchSize);
-        const data = await withRetry(() => this.request<{ data: { index: number; embedding: number[] }[] }>("/embeddings", {
-          model: this.modelId(this.embedModelUri),
-          input,
-          // Jina's retrieval embedders are trained per task; the text itself stays raw.
-          ...(isJinaEndpoint(this.baseUrl) ? { task: options.isQuery ? "retrieval.query" : "retrieval.passage" } : {}),
-          ...pin,
-        }), { onRetry: status => options.onThrottle?.(status) });
+        const data = await withRetry(async () => {
+          try {
+            return await this.request<{ provider?: string; data: { index: number; embedding: number[] }[] }>("/embeddings", {
+              model: this.modelId(this.embedModelUri),
+              input,
+              // Jina's retrieval embedders are trained per task; the text itself stays raw.
+              ...(isJinaEndpoint(this.baseUrl) ? { task: options.isQuery ? "retrieval.query" : "retrieval.passage" } : {}),
+              ...pin,
+            });
+          } catch (error) {
+            // 0 = no answer (network error, timeout); a 200 whose body is not JSON did answer.
+            const status = error instanceof HttpStatusError ? error.status : error instanceof SyntaxError ? "invalid-json" : 0;
+            console.error(`embed: request failed status=${status} provider=${"provider" in pin ? provider : "unpinned"}`);
+            throw error;
+          }
+        }, { onRetry: status => options.onThrottle?.(status) });
+        if (data.provider && !options.isQuery && data.provider !== this.lastServedBy) {
+          this.lastServedBy = data.provider;
+          console.error(`embed: served by provider=${data.provider}`);
+        }
         for (const item of data.data) {
           results[offset + item.index] = { embedding: item.embedding, model };
         }
