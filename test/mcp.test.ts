@@ -1428,6 +1428,12 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     const served = await call(23, "meetings/*.md");
     expect(served.json.result.isError).toBeFalsy();
     expect(served.json.result.content.length).toBeGreaterThan(0);
+
+    // a quoted docid is routed to the docid path by findDocuments, never picomatch
+    for (const [id, pattern] of [[24, '"abc123"'], [25, "'#abc123'"]] as const) {
+      const docid = await call(id, pattern);
+      expect(JSON.stringify(docid.json.result)).not.toMatch(/not supported/i);
+    }
   });
 
   test("unsupported protocol version is UnsupportedProtocolVersionError (-32022)", async () => {

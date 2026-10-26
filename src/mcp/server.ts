@@ -37,7 +37,7 @@ import {
 } from "../index.js";
 import { getConfigPath, loadConfig } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
-import { enableProductionMode } from "../store.js";
+import { enableProductionMode, isDocid } from "../store.js";
 import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
@@ -794,7 +794,8 @@ Intent-aware lex (C++ performance, not sports):
       }),
     },
     track(async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
-      const refusal = validateMcpGlobPattern(pattern);
+      // a docid (quoted or not) is routed by findDocuments to the docid path, never picomatch
+      const refusal = isDocid(pattern) ? null : validateMcpGlobPattern(pattern);
       if (refusal) {
         return { content: [{ type: "text", text: refusal }], isError: true };
       }
