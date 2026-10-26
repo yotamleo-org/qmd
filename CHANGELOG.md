@@ -30,6 +30,13 @@ Carried on top of tobi/qmd main (HIMMEL-5952 resync):
   status of every failed attempt; the provider pin keeps
   `allow_fallbacks: false` because vectors differ across providers
   (HIMMEL-7593).
+- MCP `multi_get` allowlists its glob before it reaches picomatch, whose ReDoS
+  advisories have no patched release: name characters plus `*`, `?` and
+  `[...]` classes only (no braces, parentheses, `|`, `+` or `!`), at most 256
+  characters, 3 runs of `*` and 3 classes; plain comma lists (which never reach
+  picomatch) are bounded at 200 entries, 256 characters per entry and 16 KiB
+  instead, and a docid over 256 characters is refused; the CLI is unchanged
+  (HIMMEL-7227).
 
 ### Fixed
 
