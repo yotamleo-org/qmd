@@ -14,6 +14,8 @@ import {
   MCP_GLOB_MAX_LENGTH,
   MCP_GLOB_MAX_WILDCARD_RUNS,
   MCP_GLOB_MAX_CLASSES,
+  MCP_COMMA_LIST_MAX_ENTRIES,
+  MCP_COMMA_LIST_MAX_LENGTH,
 } from "../src/mcp/glob-guard.js";
 
 describe("validateMcpGlobPattern", () => {
@@ -83,6 +85,21 @@ describe("validateMcpGlobPattern", () => {
     const list = Array.from({ length: 40 }, (_, i) => `notes/file-${i}.md`).join(", ");
     expect(list.length).toBeGreaterThan(MCP_GLOB_MAX_LENGTH);
     expect(validateMcpGlobPattern(list)).toBeNull();
+  });
+
+  test("bounds a plain comma list by entry count and total size", () => {
+    expect(MCP_COMMA_LIST_MAX_ENTRIES).toBe(200);
+    expect(MCP_COMMA_LIST_MAX_LENGTH).toBe(16 * 1024);
+    const list = (n: number) => Array.from({ length: n }, (_, i) => `n/f${i}.md`).join(",");
+    expect(validateMcpGlobPattern(list(MCP_COMMA_LIST_MAX_ENTRIES))).toBeNull();
+    expect(validateMcpGlobPattern(list(MCP_COMMA_LIST_MAX_ENTRIES + 1))).toMatch(/too many entries/i);
+    // empty entries do not count toward the cap
+    expect(validateMcpGlobPattern(list(MCP_COMMA_LIST_MAX_ENTRIES) + ",,, ,")).toBeNull();
+    // few entries, but over the size cap
+    const long = ["a".repeat(MCP_COMMA_LIST_MAX_LENGTH - 10), "b.md"].join(",");
+    expect(long.length).toBeLessThanOrEqual(MCP_COMMA_LIST_MAX_LENGTH);
+    expect(validateMcpGlobPattern(long)).toBeNull();
+    expect(validateMcpGlobPattern(long + "xxxxxxxxxxx")).toMatch(/too long/i);
   });
 
   test("refuses more than the allowed runs of * (the plain-star backtracking blow-up)", () => {

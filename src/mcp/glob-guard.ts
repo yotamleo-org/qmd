@@ -25,6 +25,12 @@ export const MCP_GLOB_MAX_WILDCARD_RUNS = 3;
 /** Most `[...]` classes accepted. */
 export const MCP_GLOB_MAX_CLASSES = 3;
 
+/** Most entries accepted in a plain comma list; the documented examples have a handful. */
+export const MCP_COMMA_LIST_MAX_ENTRIES = 200;
+
+/** Longest plain comma list accepted (it is exempt from the 256-char glob cap). */
+export const MCP_COMMA_LIST_MAX_LENGTH = 16 * 1024;
+
 const CLASS = /\[([^\]]*)\]/g;
 /** Outside a class: path and name characters, `,` and the wildcards `*` `?`. */
 const DISALLOWED_OUTSIDE = /[^\p{L}\p{N}\p{M} ._\-/:#~,@&=%'*?]/u;
@@ -45,7 +51,17 @@ function unsupported(char: string): string {
 
 /** Returns an error message for a refused pattern, or null when it may go on to picomatch. */
 export function validateMcpGlobPattern(pattern: string): string | null {
-  if (isPlainCommaList(pattern)) return null;
+  if (isPlainCommaList(pattern)) {
+    // Never reaches picomatch, but `findDocuments` resolves every entry in a synchronous loop.
+    if (pattern.length > MCP_COMMA_LIST_MAX_LENGTH) {
+      return `Comma-separated list too long (${pattern.length} chars, max ${MCP_COMMA_LIST_MAX_LENGTH}).`;
+    }
+    const entries = pattern.split(",").filter((entry) => entry.trim() !== "").length;
+    if (entries > MCP_COMMA_LIST_MAX_ENTRIES) {
+      return `Comma-separated list has too many entries (${entries}, max ${MCP_COMMA_LIST_MAX_ENTRIES}).`;
+    }
+    return null;
+  }
 
   if (pattern.length > MCP_GLOB_MAX_LENGTH) {
     return `Glob pattern too long (${pattern.length} chars, max ${MCP_GLOB_MAX_LENGTH}).`;
