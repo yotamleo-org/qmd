@@ -95,11 +95,34 @@ describe("validateMcpGlobPattern", () => {
     expect(validateMcpGlobPattern(list(MCP_COMMA_LIST_MAX_ENTRIES + 1))).toMatch(/too many entries/i);
     // empty entries do not count toward the cap
     expect(validateMcpGlobPattern(list(MCP_COMMA_LIST_MAX_ENTRIES) + ",,, ,")).toBeNull();
-    // few entries, but over the size cap
-    const long = ["a".repeat(MCP_COMMA_LIST_MAX_LENGTH - 10), "b.md"].join(",");
-    expect(long.length).toBeLessThanOrEqual(MCP_COMMA_LIST_MAX_LENGTH);
-    expect(validateMcpGlobPattern(long)).toBeNull();
-    expect(validateMcpGlobPattern(long + "xxxxxxxxxxx")).toMatch(/too long/i);
+  });
+
+  test("bounds the total size of a plain comma list at exactly 16 KiB", () => {
+    // entries of 255 chars joined by commas, the last one padded so the list is exactly `total` chars
+    const exact = (total: number) => {
+      const parts: string[] = [];
+      let used = 0;
+      while (total - used > MCP_GLOB_MAX_LENGTH) {
+        parts.push("a".repeat(MCP_GLOB_MAX_LENGTH - 1));
+        used += MCP_GLOB_MAX_LENGTH;
+      }
+      parts.push("a".repeat(total - used));
+      return parts.join(",");
+    };
+    expect(exact(MCP_COMMA_LIST_MAX_LENGTH).length).toBe(MCP_COMMA_LIST_MAX_LENGTH);
+    expect(validateMcpGlobPattern(exact(MCP_COMMA_LIST_MAX_LENGTH))).toBeNull();
+    expect(validateMcpGlobPattern(exact(MCP_COMMA_LIST_MAX_LENGTH + 1))).toMatch(/list too long/i);
+  });
+
+  test("caps every entry of a plain comma list at the glob length", () => {
+    // findDocuments runs a levenshtein scan over every path for each unresolved entry,
+    // so one huge entry is as costly as a huge docid
+    expect(validateMcpGlobPattern(["a".repeat(MCP_GLOB_MAX_LENGTH), "b.md"].join(","))).toBeNull();
+    expect(validateMcpGlobPattern(["b.md", "a".repeat(MCP_GLOB_MAX_LENGTH)].join(", "))).toBeNull();
+    expect(validateMcpGlobPattern(["a".repeat(MCP_GLOB_MAX_LENGTH + 1), "b.md"].join(","))).toMatch(/entry too long/i);
+    expect(validateMcpGlobPattern("a".repeat(16000) + ",b.md")).toMatch(/entry too long/i);
+    // the entry is measured as findDocuments sees it, trimmed
+    expect(validateMcpGlobPattern([" ".repeat(50) + "a".repeat(MCP_GLOB_MAX_LENGTH), "b.md"].join(","))).toBeNull();
   });
 
   test("refuses more than the allowed runs of * (the plain-star backtracking blow-up)", () => {

@@ -1432,7 +1432,8 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     // a quoted docid is routed to the docid path by findDocuments, never picomatch
     for (const [id, pattern] of [[24, '"abc123"'], [25, "'#abc123'"]] as const) {
       const docid = await call(id, pattern);
-      expect(JSON.stringify(docid.json.result)).not.toMatch(/not supported/i);
+      // the docid path ran and found nothing, rather than the guard refusing the quote
+      expect(docid.json.result.content[0].text).toContain(`File not found: ${pattern}`);
     }
     // ...but an over-long hex string is not a free pass: findDocuments would levenshtein it against every path
     const longDocid = await call(26, "a".repeat(300));

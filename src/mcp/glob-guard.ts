@@ -56,9 +56,14 @@ export function validateMcpGlobPattern(pattern: string): string | null {
     if (pattern.length > MCP_COMMA_LIST_MAX_LENGTH) {
       return `Comma-separated list too long (${pattern.length} chars, max ${MCP_COMMA_LIST_MAX_LENGTH}).`;
     }
-    const entries = pattern.split(",").filter((entry) => entry.trim() !== "").length;
-    if (entries > MCP_COMMA_LIST_MAX_ENTRIES) {
-      return `Comma-separated list has too many entries (${entries}, max ${MCP_COMMA_LIST_MAX_ENTRIES}).`;
+    const entries = pattern.split(",").map((entry) => entry.trim()).filter(Boolean);
+    if (entries.length > MCP_COMMA_LIST_MAX_ENTRIES) {
+      return `Comma-separated list has too many entries (${entries.length}, max ${MCP_COMMA_LIST_MAX_ENTRIES}).`;
+    }
+    // a miss on an entry runs a levenshtein scan over every path, so an entry is capped like a glob
+    const longest = entries.find((entry) => entry.length > MCP_GLOB_MAX_LENGTH);
+    if (longest) {
+      return `Comma-separated list entry too long (${longest.length} chars, max ${MCP_GLOB_MAX_LENGTH}).`;
     }
     return null;
   }
