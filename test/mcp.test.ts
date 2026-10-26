@@ -1215,6 +1215,26 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result.content.length).toBeGreaterThan(0);
   });
 
+  test("POST /mcp tools/call multi_get refuses a brace glob but still serves a plain one", async () => {
+    const refused = await mcpRequest(
+      "tools/call",
+      { name: "multi_get", arguments: { pattern: "{readme,api}.md" } },
+      { "Mcp-Name": "multi_get" },
+      5,
+    );
+    expect(refused.json.result.isError).toBe(true);
+    expect(refused.json.result.content[0].text).toMatch(/brace/i);
+
+    const served = await mcpRequest(
+      "tools/call",
+      { name: "multi_get", arguments: { pattern: "meetings/*.md" } },
+      { "Mcp-Name": "multi_get" },
+      6,
+    );
+    expect(served.json.result.isError).toBeFalsy();
+    expect(served.json.result.content.length).toBeGreaterThan(0);
+  });
+
   test("POST /mcp tools/call query returns absolute source-file line numbers, not chunk-local", async () => {
     const { status, json } = await mcpRequest(
       "tools/call",

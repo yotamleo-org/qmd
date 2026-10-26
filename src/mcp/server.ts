@@ -41,6 +41,7 @@ import { enableProductionMode } from "../store.js";
 import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
+import { validateMcpGlobPattern } from "./glob-guard.js";
 import { cancelTask, getTask, TASKS_EXTENSION, withTask } from "./tasks.js";
 
 // =============================================================================
@@ -793,6 +794,10 @@ Intent-aware lex (C++ performance, not sports):
       }),
     },
     track(async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
+      const refusal = validateMcpGlobPattern(pattern);
+      if (refusal) {
+        return { content: [{ type: "text", text: refusal }], isError: true };
+      }
       const { docs, errors } = await store.multiGet(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
 
       if (docs.length === 0 && errors.length === 0) {
