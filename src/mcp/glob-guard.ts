@@ -63,7 +63,8 @@ export function validateMcpGlobPattern(pattern: string): string | null {
   if (classes.length > MCP_GLOB_MAX_CLASSES) {
     return `Too many [...] classes in glob pattern (max ${MCP_GLOB_MAX_CLASSES}).`;
   }
-  if ((outside.match(/\*+/g)?.length ?? 0) > MCP_GLOB_MAX_WILDCARD_RUNS) {
+  // Counted on the raw pattern: a class between two stars does not merge them (picomatch keeps both).
+  if ((pattern.match(/\*+/g)?.length ?? 0) > MCP_GLOB_MAX_WILDCARD_RUNS) {
     return `Too many wildcards in glob pattern (max ${MCP_GLOB_MAX_WILDCARD_RUNS} runs of *).`;
   }
   return null;

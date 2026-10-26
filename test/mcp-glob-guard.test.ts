@@ -89,6 +89,10 @@ describe("validateMcpGlobPattern", () => {
     expect(MCP_GLOB_MAX_WILDCARD_RUNS).toBe(3);
     expect(validateMcpGlobPattern("a*".repeat(MCP_GLOB_MAX_WILDCARD_RUNS + 1) + "b")).toMatch(/wildcard/i);
     expect(validateMcpGlobPattern("a*".repeat(MCP_GLOB_MAX_WILDCARD_RUNS) + "b")).toBeNull();
+    // a class between two stars does not merge them: this is 6 runs, not 3
+    expect(validateMcpGlobPattern("*[a-z]*[a-z]*[a-z]*-*-*Q")).toMatch(/wildcard/i);
+    expect(validateMcpGlobPattern("*[a]*[a]*[a]*b")).toMatch(/wildcard/i);
+    expect(validateMcpGlobPattern("*[a]*[a]*[a]b")).toBeNull();
     // ** is one run, so the documented recursive shapes stay legal
     expect(validateMcpGlobPattern("docs/**/2025-*/*.md")).toBeNull();
   });
@@ -111,6 +115,7 @@ describe("validateMcpGlobPattern", () => {
   test("the costliest accepted shapes match a long path in bounded time", () => {
     const path = "a".repeat(300);
     const worstAccepted = [
+      "*[a]*[a]*[a]b",
       "a*".repeat(MCP_GLOB_MAX_WILDCARD_RUNS) + "b",
       "*a*a*a" + "[a]".repeat(MCP_GLOB_MAX_CLASSES) + "b",
       "a?".repeat(100) + "b",
