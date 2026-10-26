@@ -3,9 +3,11 @@
  *
  * `multi_get` hands its `pattern` to picomatch (which expands braces via the
  * `braces` package). Both have unpatched ReDoS / resource-exhaustion advisories,
- * and the pattern comes from the MCP client, so crafted input is refused here,
- * before it reaches picomatch. The CLI and SDK paths are not affected: their
- * pattern comes from the local operator, who keeps brace expansion.
+ * and the pattern comes from the MCP client, so it is checked here, before it
+ * reaches picomatch. picomatch passes `(`, `|`, `+` and bracket bodies straight
+ * into the regex as live operators, so the check is an allowlist rather than a
+ * list of known-bad syntax. The CLI and SDK paths are not affected: their pattern
+ * comes from the local operator, who keeps brace expansion.
  *
  * Pure so it can be unit-tested without a server.
  */
@@ -20,23 +22,48 @@ export const MCP_GLOB_MAX_LENGTH = 256;
  */
 export const MCP_GLOB_MAX_WILDCARD_RUNS = 3;
 
+/** Most `[...]` classes accepted. */
+export const MCP_GLOB_MAX_CLASSES = 3;
+
+const CLASS = /\[([^\]]*)\]/g;
+/** Outside a class: path and name characters, `,` and the wildcards `*` `?`. */
+const DISALLOWED_OUTSIDE = /[^\p{L}\p{N}\p{M} ._\-/:#~,@&=%'*?]/u;
+/** Inside a class: plain name characters, no negation, ranges of letters and digits only via `-`. */
+const DISALLOWED_IN_CLASS = /[^\p{L}\p{N}\p{M} ._\-/:~]/u;
+
+const ALLOWED_SET =
+  "letters, digits, space and . _ - / : # ~ , @ & = % ' plus the wildcards * ? and [...] classes of letters, digits and . _ - / : ~";
+
 /** The same test `findDocuments` uses to route a pattern to the comma-list path (no picomatch). */
 function isPlainCommaList(pattern: string): boolean {
   return pattern.includes(",") && !/[*?{]/.test(pattern);
 }
 
+function unsupported(char: string): string {
+  return `The character ${JSON.stringify(char)} is not supported in MCP glob patterns. Allowed: ${ALLOWED_SET}.`;
+}
+
 /** Returns an error message for a refused pattern, or null when it may go on to picomatch. */
 export function validateMcpGlobPattern(pattern: string): string | null {
-  if (/[{}]/.test(pattern)) {
-    return "Brace expansion ({...}) is not supported in MCP glob patterns; use a comma-separated list instead.";
-  }
-  if (/[@!+*?]\(/.test(pattern)) {
-    return "Extglob syntax (@( !( +( *( ?() is not supported in MCP glob patterns.";
-  }
-  if (!isPlainCommaList(pattern) && pattern.length > MCP_GLOB_MAX_LENGTH) {
+  if (isPlainCommaList(pattern)) return null;
+
+  if (pattern.length > MCP_GLOB_MAX_LENGTH) {
     return `Glob pattern too long (${pattern.length} chars, max ${MCP_GLOB_MAX_LENGTH}).`;
   }
-  if ((pattern.match(/\*+/g)?.length ?? 0) > MCP_GLOB_MAX_WILDCARD_RUNS) {
+
+  const classes = [...pattern.matchAll(CLASS)];
+  for (const [, body] of classes) {
+    const bad = body!.length === 0 ? "[]" : body!.match(DISALLOWED_IN_CLASS)?.[0];
+    if (bad) return unsupported(bad);
+  }
+  const outside = pattern.replace(CLASS, "");
+  const bad = outside.match(DISALLOWED_OUTSIDE)?.[0];
+  if (bad) return unsupported(bad);
+
+  if (classes.length > MCP_GLOB_MAX_CLASSES) {
+    return `Too many [...] classes in glob pattern (max ${MCP_GLOB_MAX_CLASSES}).`;
+  }
+  if ((outside.match(/\*+/g)?.length ?? 0) > MCP_GLOB_MAX_WILDCARD_RUNS) {
     return `Too many wildcards in glob pattern (max ${MCP_GLOB_MAX_WILDCARD_RUNS} runs of *).`;
   }
   return null;

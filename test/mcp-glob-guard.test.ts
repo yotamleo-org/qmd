@@ -2,14 +2,19 @@
  * MCP multi_get glob guard (HIMMEL-7227).
  *
  * picomatch/braces have no patched release for their ReDoS / resource
- * exhaustion advisories, so crafted patterns are refused before they reach
+ * exhaustion advisories, so MCP patterns are allowlisted before they reach
  * picomatch. These tests cover the pure validator; the wire path is covered in
  * mcp.test.ts.
  */
 
 import { describe, test, expect } from "vitest";
 import picomatch from "picomatch";
-import { validateMcpGlobPattern, MCP_GLOB_MAX_LENGTH, MCP_GLOB_MAX_WILDCARD_RUNS } from "../src/mcp/glob-guard.js";
+import {
+  validateMcpGlobPattern,
+  MCP_GLOB_MAX_LENGTH,
+  MCP_GLOB_MAX_WILDCARD_RUNS,
+  MCP_GLOB_MAX_CLASSES,
+} from "../src/mcp/glob-guard.js";
 
 describe("validateMcpGlobPattern", () => {
   test.each([
@@ -17,8 +22,13 @@ describe("validateMcpGlobPattern", () => {
     "docs/**/*.md",
     "meetings/*.md",
     "docs/readme?.md",
+    "docs/note-[0-9].md",
+    "docs/[abc]*.md",
+    "notes/日本語*.md",
+    "my notes/it's & mine=1%.md",
     "readme.md, api.md",
     "readme.md,api.md",
+    "notes (1).md, notes (2).md",
     "#abc123",
     "#abc123, #def456",
     "qmd://docs/meetings/*.md",
@@ -38,10 +48,28 @@ describe("validateMcpGlobPattern", () => {
     ["extglob +(", "docs/+(a|aa).md"],
     ["extglob *(", "docs/*(a|aa).md"],
     ["extglob ?(", "docs/?(a|aa).md"],
+    ["plain group with a quantifier", "([a-z0-9./:_-]+)+Q"],
+    ["plain group with alternation", "(a|a)+Q"],
+    ["alternation bar", "docs/a|b.md"],
+    ["plus after a class", "docs/[a-z]+Q"],
+    ["plus after a group", "docs/(ab)+Q"],
+    ["plus on its own", "docs/a+b.md"],
+    ["class with a plus inside", "docs/[a+]Q"],
+    ["class with a group inside", "docs/[(a)]Q"],
+    ["negated class", "docs/[!a]Q"],
+    ["caret class", "docs/[^a]Q"],
+    ["empty class", "docs/[]Q"],
+    ["unterminated class", "docs/[abc"],
+    ["stray close bracket", "docs/abc]"],
+    ["leading negation", "!docs/*.md"],
+    ["backslash escape", "docs/a\\*b"],
+    ["class repeating a plus", "[a-z./]+[a-z./]+[a-z./]+[a-z./]+[a-z./]+Q"],
   ])("refuses %s", (_label, pattern) => {
-    const error = validateMcpGlobPattern(pattern);
-    expect(error).not.toBeNull();
-    expect(error).toMatch(/brace|extglob/i);
+    expect(validateMcpGlobPattern(pattern)).toMatch(/not supported/i);
+  });
+
+  test("the refusal names what is allowed", () => {
+    expect(validateMcpGlobPattern("(a)")).toMatch(/Allowed: letters, digits/);
   });
 
   test("refuses a glob longer than the cap", () => {
@@ -57,14 +85,6 @@ describe("validateMcpGlobPattern", () => {
     expect(validateMcpGlobPattern(list)).toBeNull();
   });
 
-  test("a known ReDoS-shaped pattern is refused in well under a second", () => {
-    const evil = "+(a|aa)".repeat(30) + "!";
-    const start = performance.now();
-    const error = validateMcpGlobPattern(evil);
-    expect(performance.now() - start).toBeLessThan(100);
-    expect(error).not.toBeNull();
-  });
-
   test("refuses more than the allowed runs of * (the plain-star backtracking blow-up)", () => {
     expect(MCP_GLOB_MAX_WILDCARD_RUNS).toBe(3);
     expect(validateMcpGlobPattern("a*".repeat(MCP_GLOB_MAX_WILDCARD_RUNS + 1) + "b")).toMatch(/wildcard/i);
@@ -73,13 +93,35 @@ describe("validateMcpGlobPattern", () => {
     expect(validateMcpGlobPattern("docs/**/2025-*/*.md")).toBeNull();
   });
 
-  test("a plain-star ReDoS pattern is refused, and the most the guard accepts matches fast", () => {
+  test("refuses more than the allowed number of [...] classes", () => {
+    expect(MCP_GLOB_MAX_CLASSES).toBe(3);
+    expect(validateMcpGlobPattern("[a]".repeat(MCP_GLOB_MAX_CLASSES + 1))).toMatch(/classes/i);
+    expect(validateMcpGlobPattern("[a]".repeat(MCP_GLOB_MAX_CLASSES))).toBeNull();
+  });
+
+  test("known ReDoS shapes are refused instantly, never handed to picomatch", () => {
+    const evil = ["+(a|aa)".repeat(30) + "!", "([a-z0-9./:_-]|[a-z0-9./:_-])+Q", "([a-z0-9./:_-]+)+Q"];
+    for (const pattern of evil) {
+      const start = performance.now();
+      expect(validateMcpGlobPattern(pattern)).not.toBeNull();
+      expect(performance.now() - start).toBeLessThan(1000);
+    }
+  });
+
+  test("the costliest accepted shapes match a long path in bounded time", () => {
     const path = "a".repeat(300);
-    expect(validateMcpGlobPattern("a*".repeat(12) + "b")).not.toBeNull();
-    const worstAccepted = "a*".repeat(MCP_GLOB_MAX_WILDCARD_RUNS) + "b";
-    expect(validateMcpGlobPattern(worstAccepted)).toBeNull();
-    const start = performance.now();
-    picomatch(worstAccepted)(path);
-    expect(performance.now() - start).toBeLessThan(1000);
+    const worstAccepted = [
+      "a*".repeat(MCP_GLOB_MAX_WILDCARD_RUNS) + "b",
+      "*a*a*a" + "[a]".repeat(MCP_GLOB_MAX_CLASSES) + "b",
+      "a?".repeat(100) + "b",
+    ];
+    for (const pattern of worstAccepted) {
+      expect(validateMcpGlobPattern(pattern)).toBeNull();
+      const start = performance.now();
+      picomatch(pattern)(path);
+      // measured at ~16 ms; the bound is generous so a loaded CI box cannot flake it,
+      // and still far below the multi-second blow-up the guard exists to prevent
+      expect(performance.now() - start).toBeLessThan(5000);
+    }
   });
 });

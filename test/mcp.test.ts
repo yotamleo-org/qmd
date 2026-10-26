@@ -1215,26 +1215,6 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result.content.length).toBeGreaterThan(0);
   });
 
-  test("POST /mcp tools/call multi_get refuses a brace glob but still serves a plain one", async () => {
-    const refused = await mcpRequest(
-      "tools/call",
-      { name: "multi_get", arguments: { pattern: "{readme,api}.md" } },
-      { "Mcp-Name": "multi_get" },
-      5,
-    );
-    expect(refused.json.result.isError).toBe(true);
-    expect(refused.json.result.content[0].text).toMatch(/brace/i);
-
-    const served = await mcpRequest(
-      "tools/call",
-      { name: "multi_get", arguments: { pattern: "meetings/*.md" } },
-      { "Mcp-Name": "multi_get" },
-      6,
-    );
-    expect(served.json.result.isError).toBeFalsy();
-    expect(served.json.result.content.length).toBeGreaterThan(0);
-  });
-
   test("POST /mcp tools/call query returns absolute source-file line numbers, not chunk-local", async () => {
     const { status, json } = await mcpRequest(
       "tools/call",
@@ -1426,6 +1406,28 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     );
     expect(status).toBe(400);
     expect(json.error?.code).toBe(-32020);
+  });
+
+  test("tools/call multi_get refuses a crafted glob before picomatch and still serves a plain one", async () => {
+    const call = (id: number, pattern: string) => postMcp(
+      {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "multi_get", arguments: { pattern }, _meta: mcp2026Meta },
+      },
+      { "MCP-Protocol-Version": MCP_2026, "Mcp-Method": "tools/call", "Mcp-Name": "multi_get" },
+    );
+
+    for (const [id, pattern] of [[20, "{readme,api}.md"], [21, "([a-z0-9./:_-]+)+Q"], [22, "a*a*a*a*b"]] as const) {
+      const refused = await call(id, pattern);
+      expect(refused.json.result.isError).toBe(true);
+      expect(refused.json.result.content[0].text).toMatch(/not supported|too many|too long/i);
+    }
+
+    const served = await call(23, "meetings/*.md");
+    expect(served.json.result.isError).toBeFalsy();
+    expect(served.json.result.content.length).toBeGreaterThan(0);
   });
 
   test("unsupported protocol version is UnsupportedProtocolVersionError (-32022)", async () => {
