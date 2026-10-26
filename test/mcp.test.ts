@@ -1434,6 +1434,12 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
       const docid = await call(id, pattern);
       expect(JSON.stringify(docid.json.result)).not.toMatch(/not supported/i);
     }
+    // ...but an over-long hex string is not a free pass: findDocuments would levenshtein it against every path
+    const longDocid = await call(26, "a".repeat(300));
+    expect(longDocid.json.result.isError).toBe(true);
+    expect(longDocid.json.result.content[0].text).toMatch(/too long/i);
+    const quotedLong = await call(27, `"${"a".repeat(300)}"`);
+    expect(quotedLong.json.result.isError).toBe(true);
   });
 
   test("unsupported protocol version is UnsupportedProtocolVersionError (-32022)", async () => {

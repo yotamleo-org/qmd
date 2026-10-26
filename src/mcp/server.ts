@@ -41,7 +41,7 @@ import { enableProductionMode, isDocid } from "../store.js";
 import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
-import { validateMcpGlobPattern } from "./glob-guard.js";
+import { validateMcpGlobPattern, MCP_GLOB_MAX_LENGTH } from "./glob-guard.js";
 import { cancelTask, getTask, TASKS_EXTENSION, withTask } from "./tasks.js";
 
 // =============================================================================
@@ -794,8 +794,9 @@ Intent-aware lex (C++ performance, not sports):
       }),
     },
     track(async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
-      // a docid (quoted or not) is routed by findDocuments to the docid path, never picomatch
-      const refusal = isDocid(pattern) ? null : validateMcpGlobPattern(pattern);
+      // a docid (quoted or not) is routed by findDocuments to the docid path, never picomatch;
+      // isDocid has no length limit, so an over-long one still goes through the length cap
+      const refusal = isDocid(pattern) && pattern.length <= MCP_GLOB_MAX_LENGTH ? null : validateMcpGlobPattern(pattern);
       if (refusal) {
         return { content: [{ type: "text", text: refusal }], isError: true };
       }
