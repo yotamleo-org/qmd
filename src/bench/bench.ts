@@ -37,7 +37,7 @@ import type {
 type Backend = {
   name: string;
   /** `flags` is an out-param a backend sets when its results are degraded. */
-  run: (store: QMDStore, query: BenchmarkQuery, limit: number, collection?: string, flags?: { rerankTimedOut?: boolean }) => Promise<string[]>;
+  run: (store: QMDStore, query: BenchmarkQuery, limit: number, collection?: string, flags?: { rerankTimedOut?: boolean; rerankSkipped?: boolean }) => Promise<string[]>;
 };
 
 type ParsedStructuredQuery = {
@@ -162,6 +162,7 @@ const BACKENDS: Backend[] = [
         ? await store.search({ queries: structured.searches, intent: structured.intent, limit, collection, rerank: true })
         : await store.search({ query: query.query, limit, collection, rerank: true });
       if (flags && results.some(r => r.rerankTimedOut)) flags.rerankTimedOut = true;
+      if (flags && results.some(r => r.rerankSkipped)) flags.rerankSkipped = true;
       return results.map((r: HybridQueryResult) => r.file);
     },
   },
@@ -177,7 +178,7 @@ async function runQuery(
   const start = Date.now();
 
   let resultFiles: string[];
-  const flags: { rerankTimedOut?: boolean } = {};
+  const flags: { rerankTimedOut?: boolean; rerankSkipped?: boolean } = {};
   try {
     resultFiles = await backend.run(store, query, limit, collection, flags);
   } catch {
@@ -209,6 +210,7 @@ async function runQuery(
     latency_ms,
     top_files: resultFiles.slice(0, 10),
     ...(flags.rerankTimedOut ? { rerank_timed_out: true as const } : {}),
+    ...(flags.rerankSkipped ? { rerank_skipped: true as const } : {}),
   };
 }
 

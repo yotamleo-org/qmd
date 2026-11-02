@@ -42,7 +42,7 @@ describe("query tool defaults", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("rerank is opt-in: the advertised default is false", async () => {
+  test("rerank has no fixed default: it is on for a remote reranker only (HIMMEL-8747)", async () => {
     const res = await fetch(`http://localhost:${handle.port}/mcp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
@@ -52,7 +52,7 @@ describe("query tool defaults", () => {
     const data = text.split("\n").find(l => l.startsWith("data: "));
     const body = JSON.parse(data ? data.slice(6) : text) as { result: { tools: Array<{ name: string; inputSchema: { properties: Record<string, { default?: unknown }> } }> } };
     const query = body.result.tools.find(t => t.name === "query")!;
-    expect(query.inputSchema.properties.rerank!.default).toBe(false);
+    expect(query.inputSchema.properties.rerank!.default).toBeUndefined();
   });
 });
 

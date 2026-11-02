@@ -2765,6 +2765,7 @@ type OutputRow = {
   metadata?: DocumentMetadata;
   explain?: HybridQueryExplain;
   rerankTimedOut?: true;
+  rerankSkipped?: true;
 };
 
 const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
@@ -2893,6 +2894,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         ...(snippet && { snippet }),
         ...(opts.explain && row.explain && { explain: row.explain }),
         ...(row.rerankTimedOut && { rerankTimedOut: true }),
+        ...(row.rerankSkipped && { rerankSkipped: true }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -3451,6 +3453,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       metadata: r.metadata,
       explain: r.explain,
       rerankTimedOut: r.rerankTimedOut,
+      rerankSkipped: r.rerankSkipped,
     })), displayQuery, { ...opts, limit: results.length });
     await exitIfRerankHung();
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });

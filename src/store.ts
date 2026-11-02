@@ -74,6 +74,10 @@ import {
   DEFAULT_GENERATE_MODEL_URI,
   isOpenAiModelUri,
   resolveRerankTimeoutMs,
+  tripRerankBreaker,
+  isRerankBreakerOpen,
+  rerankFailureLabel,
+  failureTripsRerankBreaker,
   resolveRerankLoadTimeoutMs,
   RerankTimeoutError,
   RerankLoadTimeoutError,
@@ -6142,7 +6146,8 @@ export async function rerank(query: string, documents: { file: string; text: str
           clearTimeout(loadTimer);
         }
       }
-      const timeoutMs = resolveRerankTimeoutMs();
+      const remoteRerank = isOpenAiModelUri(cacheModel);
+      const timeoutMs = resolveRerankTimeoutMs(remoteRerank);
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         rerankResult = await Promise.race([
@@ -6151,14 +6156,23 @@ export async function rerank(query: string, documents: { file: string; text: str
             timer = setTimeout(() => reject(new RerankTimeoutError(timeoutMs)), timeoutMs);
           }),
         ]);
+        // A remote 200 that scores fewer documents than were sent (empty or partial) is not a rerank.
+        if (remoteRerank) {
+          const scored = new Set(rerankResult.results.map(r => r.index));
+          if (sentDocs.some((_, i) => !scored.has(i))) throw new Error("reranker returned partial results");
+        }
       } catch (err) {
         // The hung native call cannot be cancelled: refuse all further native work.
         if (err instanceof RerankTimeoutError) llm.poison?.(err.message);
+        // A remote reranker has nothing to poison: stop asking it for a while instead.
+        if (remoteRerank && failureTripsRerankBreaker(err)) tripRerankBreaker(cacheModel);
         throw err;
       } finally {
         clearTimeout(timer);
       }
     }
+    // No rerank context (out of VRAM): the backend scores everything 0.5. Those are not scores; never cache them.
+    if (rerankResult.model === "fallback") throw new Error("reranker has no usable context");
     signal?.throwIfAborted();
 
     // Complete scores arrive before any writes. Index, not file, identifies a
@@ -7032,8 +7046,10 @@ export interface HybridQueryResult {
   docid: string;            // content hash prefix (6 chars)
   metadata: DocumentMetadata; // indexed qmd.metadata for the document
   explain?: HybridQueryExplain;
-  /** Set when the reranker timed out: scores are RRF-only (unreranked). */
+  /** Set when the reranker timed out or failed: scores are RRF-only (unreranked). */
   rerankTimedOut?: true;
+  /** Set when the caller wanted a rerank but the reranker was off, remembered as hung or behind an open breaker when the search started. */
+  rerankSkipped?: true;
 }
 
 /**
@@ -7097,7 +7113,11 @@ export async function hybridQuery(
   const filter = options?.filter;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled() || isRerankHangRemembered();
+  // Read the reranker's state once: the same read decides the skip and is reported on the results.
+  const callerSkipsRerank = options?.skipRerank ?? false;
+  const rerankOffNow = isRerankDisabled() || isRerankHangRemembered() || isRerankBreakerOpen(store.llm?.rerankModelName);
+  const skipRerank = callerSkipsRerank || rerankOffNow;
+  const rerankSkipped = !callerSkipsRerank && rerankOffNow;
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -7303,6 +7323,7 @@ export async function hybridQuery(
           score: rrfScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
+          ...(rerankSkipped ? { rerankSkipped: true as const } : {}),
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -7334,9 +7355,12 @@ export async function hybridQuery(
   try {
     reranked = await store.rerank(query, chunksToRerank, undefined, intent, signal);
   } catch (err) {
-    // A concurrent search may have poisoned the process after the skip check above.
-    if (!(err instanceof RerankTimeoutError || isLlamaPoisoned())) throw err;
-    // Fall back to the unreranked hybrid (RRF) order.
+    // The caller's own cancellation is not a rerank failure: it ends the search with the rerank's error.
+    if (signal?.aborted) throw err;
+    // Any rerank failure (timeout, poison, a 401/429/5xx or network error from a remote reranker)
+    // falls back to the unreranked hybrid (RRF) order, flagged rerankTimedOut: a search that works
+    // without the reranker must not fail because of it.
+    console.error(`QMD: rerank failed (${rerankFailureLabel(err)}); serving unreranked results`);
     rerankTimedOut = true;
     reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
   }
@@ -7544,7 +7568,11 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled() || isRerankHangRemembered();
+  // Read the reranker's state once: the same read decides the skip and is reported on the results.
+  const callerSkipsRerank = options?.skipRerank ?? false;
+  const rerankOffNow = isRerankDisabled() || isRerankHangRemembered() || isRerankBreakerOpen(store.llm?.rerankModelName);
+  const skipRerank = callerSkipsRerank || rerankOffNow;
+  const rerankSkipped = !callerSkipsRerank && rerankOffNow;
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -7726,6 +7754,7 @@ export async function structuredSearch(
           score: rrfScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
+          ...(rerankSkipped ? { rerankSkipped: true as const } : {}),
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -7757,9 +7786,12 @@ export async function structuredSearch(
   try {
     reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent, signal);
   } catch (err) {
-    // A concurrent search may have poisoned the process after the skip check above.
-    if (!(err instanceof RerankTimeoutError || isLlamaPoisoned())) throw err;
-    // Fall back to the unreranked hybrid (RRF) order.
+    // The caller's own cancellation is not a rerank failure: it ends the search with the rerank's error.
+    if (signal?.aborted) throw err;
+    // Any rerank failure (timeout, poison, a 401/429/5xx or network error from a remote reranker)
+    // falls back to the unreranked hybrid (RRF) order, flagged rerankTimedOut: a search that works
+    // without the reranker must not fail because of it.
+    console.error(`QMD: rerank failed (${rerankFailureLabel(err)}); serving unreranked results`);
     rerankTimedOut = true;
     reranked = chunksToRerank.map(c => ({ file: c.file, score: 0 }));
   }
