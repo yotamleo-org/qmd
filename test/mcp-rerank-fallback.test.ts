@@ -164,6 +164,15 @@ describe("query tool: a failing rerank never fails the search", () => {
       });
     }
 
+    test(`${shape}: a process poisoned by an earlier hang skips the reranker and the answer says so`, async () => {
+      await start("remote");
+      markLlamaPoisonedForTests();
+      const res = await rpc(handle.port, args);
+      expect(rerankCalls).toBe(0);
+      expect(res.result?.structuredContent.rerankSkipped).toBe(true);
+      expect(res.result?.content[0].text).toMatch(/unreranked/);
+    });
+
     test(`${shape}: an open breaker skips the reranker and the answer says so`, async () => {
       await start("remote");
       tripRerankBreaker();
