@@ -5495,7 +5495,7 @@ export async function rerank(query: string, documents: { file: string; text: str
       // The hung native call cannot be cancelled: refuse all further native work.
       if (err instanceof RerankTimeoutError) llm.poison?.(err.message);
       // A remote reranker has nothing to poison: stop asking it for a while instead.
-      if (remoteRerank && failureTripsRerankBreaker(err)) tripRerankBreaker();
+      if (remoteRerank && failureTripsRerankBreaker(err)) tripRerankBreaker(cacheModel);
       throw err;
     } finally {
       clearTimeout(timer);
@@ -6434,7 +6434,7 @@ export async function hybridQuery(
   const intent = options?.intent;
   // Read the reranker's state once: the same read decides the skip and is reported on the results.
   const callerSkipsRerank = options?.skipRerank ?? false;
-  const rerankOffNow = isRerankDisabled() || isRerankHangRemembered() || isRerankBreakerOpen();
+  const rerankOffNow = isRerankDisabled() || isRerankHangRemembered() || isRerankBreakerOpen(store.llm?.rerankModelName);
   const skipRerank = callerSkipsRerank || rerankOffNow;
   const rerankSkipped = !callerSkipsRerank && rerankOffNow;
   const hooks = options?.hooks;
@@ -6868,7 +6868,7 @@ export async function structuredSearch(
   const intent = options?.intent;
   // Read the reranker's state once: the same read decides the skip and is reported on the results.
   const callerSkipsRerank = options?.skipRerank ?? false;
-  const rerankOffNow = isRerankDisabled() || isRerankHangRemembered() || isRerankBreakerOpen();
+  const rerankOffNow = isRerankDisabled() || isRerankHangRemembered() || isRerankBreakerOpen(store.llm?.rerankModelName);
   const skipRerank = callerSkipsRerank || rerankOffNow;
   const rerankSkipped = !callerSkipsRerank && rerankOffNow;
   const hooks = options?.hooks;

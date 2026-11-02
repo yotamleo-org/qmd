@@ -45,6 +45,7 @@ import {
 } from "../src/llm.ts";
 
 type Mode = "ok" | "400" | "401" | "429" | "500" | "hang" | "empty" | "partial" | "reset";
+const STUB_MODEL = "openai:stub-rerank";
 const PROVIDER_DETAIL = "provider-detail-must-not-be-logged";
 type Rpc = { result?: Record<string, any> };
 
@@ -177,7 +178,7 @@ describe("query tool: a failing rerank never fails the search", () => {
 
     test(`${caller}: an open breaker skips the reranker and the answer says so`, async () => {
       await start("remote");
-      tripRerankBreaker();
+      tripRerankBreaker(STUB_MODEL);
       const res = await rpc(handle.port, args);
       expect(res.result?.isError).toBeUndefined();
       expect(rerankCalls).toBe(0);
@@ -188,7 +189,7 @@ describe("query tool: a failing rerank never fails the search", () => {
 
   test("a breaker that expires while the search runs: the answer still says the search skipped the reranker", async () => {
     await start("remote");
-    tripRerankBreaker();
+    tripRerankBreaker(STUB_MODEL);
     afterSearch.fn = resetRerankBreakerForTests; // the breaker closes after the search decided to skip
     const res = await rpc(handle.port, searchArgs);
     expect(rerankCalls).toBe(0);
@@ -196,9 +197,18 @@ describe("query tool: a failing rerank never fails the search", () => {
     expect(res.result?.content[0].text).toMatch(/unreranked/);
   });
 
+  test("a breaker open for another reranker model does not skip this one", async () => {
+    await start("remote");
+    tripRerankBreaker("openai:some-other-reranker");
+    const res = await rpc(handle.port, searchArgs);
+    expect(rerankCalls).toBe(1);
+    expect(res.result?.structuredContent.rerankSkipped).toBeUndefined();
+    expect(res.result?.content[0].text).not.toMatch(/unreranked/);
+  });
+
   test("a breaker that opens while the search runs does not call a reranked answer unreranked", async () => {
     await start("remote");
-    afterSearch.fn = tripRerankBreaker; // opens after the search already reranked
+    afterSearch.fn = () => tripRerankBreaker(STUB_MODEL); // opens after the search already reranked
     const res = await rpc(handle.port, searchArgs);
     expect(rerankCalls).toBe(1);
     expect(res.result?.structuredContent.rerankSkipped).toBeUndefined();
@@ -212,12 +222,12 @@ describe("query tool: a failing rerank never fails the search", () => {
       await start("remote");
       const first = await rpc(handle.port, searchArgs);
       expect(first.result?.content[0].text).toMatch(/unreranked/);
-      expect(isRerankBreakerOpen()).toBe(false);
+      expect(isRerankBreakerOpen(STUB_MODEL)).toBe(false);
       await rpc(handle.port, searchArgs);
       expect(rerankCalls).toBe(2); // asked again
       mode = "500";
       await rpc(handle.port, searchArgs);
-      expect(isRerankBreakerOpen()).toBe(true);
+      expect(isRerankBreakerOpen(STUB_MODEL)).toBe(true);
     });
   }
 
@@ -229,7 +239,7 @@ describe("query tool: a failing rerank never fails the search", () => {
     expect(res.result?.isError).toBeUndefined();
     expect(res.result?.structuredContent.results.every((r: any) => r.rerankTimedOut === true)).toBe(true);
     expect(res.result?.content[0].text).toMatch(/unreranked/);
-    expect(isRerankBreakerOpen()).toBe(true);
+    expect(isRerankBreakerOpen(STUB_MODEL)).toBe(true);
   });
 
   test("a remote 200 that scores only some of the documents is flagged unreranked", async () => {
@@ -244,7 +254,7 @@ describe("query tool: a failing rerank never fails the search", () => {
 
   test("REST /query forwards rerankSkipped when the breaker is open, and never asks the reranker", async () => {
     await start("remote");
-    tripRerankBreaker();
+    tripRerankBreaker(STUB_MODEL);
     const res = await fetch(`http://localhost:${handle.port}/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -378,22 +388,22 @@ describe("the rerank breaker's lifetime", () => {
 
   test("it closes by itself once QMD_RERANK_BREAKER_MS has passed", async () => {
     process.env.QMD_RERANK_BREAKER_MS = "60";
-    tripRerankBreaker();
-    expect(isRerankBreakerOpen()).toBe(true);
+    tripRerankBreaker(STUB_MODEL);
+    expect(isRerankBreakerOpen(STUB_MODEL)).toBe(true);
     await new Promise(r => setTimeout(r, 120));
-    expect(isRerankBreakerOpen()).toBe(false);
+    expect(isRerankBreakerOpen(STUB_MODEL)).toBe(false);
   });
 
   test("unset or empty QMD_RERANK_BREAKER_MS means the 60 s default, only an explicit 0 turns it off", () => {
     for (const value of [undefined, "", "  "]) {
       resetRerankBreakerForTests();
       if (value === undefined) delete process.env.QMD_RERANK_BREAKER_MS; else process.env.QMD_RERANK_BREAKER_MS = value;
-      tripRerankBreaker();
-      expect(isRerankBreakerOpen()).toBe(true);
+      tripRerankBreaker(STUB_MODEL);
+      expect(isRerankBreakerOpen(STUB_MODEL)).toBe(true);
     }
     resetRerankBreakerForTests();
     process.env.QMD_RERANK_BREAKER_MS = "0";
-    tripRerankBreaker();
-    expect(isRerankBreakerOpen()).toBe(false);
+    tripRerankBreaker(STUB_MODEL);
+    expect(isRerankBreakerOpen(STUB_MODEL)).toBe(false);
   });
 });

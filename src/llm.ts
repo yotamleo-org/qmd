@@ -354,15 +354,16 @@ export function resolveRerankTimeoutMs(remote = false): number {
 }
 
 const DEFAULT_RERANK_BREAKER_MS = 60_000;
-let rerankBreakerUntil = 0;
+// One breaker per reranker model: a failing remote reranker never switches off another store's.
+const rerankBreakerUntil = new Map<string, number>();
 
 /** A remote reranker that failed or hung stays skipped for this long (QMD_RERANK_BREAKER_MS, default 60 s), so queued searches do not each wait out its budget. */
-export function tripRerankBreaker(): void {
+export function tripRerankBreaker(model: string): void {
   // Unset or empty means the default; only an explicit 0 turns the breaker off.
   const text = process.env.QMD_RERANK_BREAKER_MS?.trim();
   const raw = text ? Number(text) : NaN;
   const ttl = Number.isFinite(raw) && raw >= 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_BREAKER_MS;
-  rerankBreakerUntil = Date.now() + ttl;
+  rerankBreakerUntil.set(model, Date.now() + ttl);
 }
 
 /** What a rerank failure may say in a log line: the status or kind, never the provider's response text. */
@@ -377,11 +378,11 @@ export function failureTripsRerankBreaker(err: unknown): boolean {
   if (err instanceof HttpStatusError) return err.status >= 500;
   return true;
 }
-export function isRerankBreakerOpen(): boolean {
-  return Date.now() < rerankBreakerUntil;
+export function isRerankBreakerOpen(model: string | undefined): boolean {
+  return model !== undefined && Date.now() < (rerankBreakerUntil.get(model) ?? 0);
 }
 export function resetRerankBreakerForTests(): void {
-  rerankBreakerUntil = 0;
+  rerankBreakerUntil.clear();
 }
 
 const DEFAULT_RERANK_LOAD_TIMEOUT_MS = 600_000;
