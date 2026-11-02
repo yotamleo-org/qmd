@@ -52,7 +52,8 @@ describe("query tool as an MCP task — HTTP", () => {
     dir = mkdtempSync(join(tmpdir(), "qmd-task-"));
     process.env.INDEX_PATH = join(dir, "index.sqlite");
     process.env.QMD_CONFIG_DIR = dir;
-    writeFileSync(join(dir, "index.yml"), "collections: {}\n");
+    // A remote reranker, so rerank is on by default; the search itself is stubbed.
+    writeFileSync(join(dir, "index.yml"), "collections: {}\nmodels:\n  rerank: openai:stub\n  openai_base_url: http://127.0.0.1:1/v1\n");
     searchStub.fn = async () => {
       await gate;
       return [{

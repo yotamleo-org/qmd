@@ -38,7 +38,7 @@ import {
 import { getConfigPath, loadConfig } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode, isDocid } from "../store.js";
-import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels, isRerankDisabled, isRerankHangRemembered } from "../llm.js";
+import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels, isRerankDisabled, isRerankHangRemembered, isRerankBreakerOpen } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
 import { validateMcpGlobPattern, MCP_GLOB_MAX_LENGTH } from "./glob-guard.js";
@@ -71,6 +71,17 @@ export function exitIfRerankHung(store?: QMDStore): void {
   if (rerankHangLogged) return;
   rerankHangLogged = true;
   console.error("QMD: rerank (or its model load) timed out; serving unreranked results from now on (QMD_RERANK=off skips the reranker at startup)");
+}
+
+/** True when the reranker is an `openai:` model: it answers in about a second and has no native state. */
+function rerankIsRemote(store?: QMDStore): boolean {
+  const llm = store?.internal.llm;
+  if (llm) return isOpenAiModelUri(llm.rerankModelName);
+  try {
+    return isOpenAiModelUri(resolveModels(loadConfig().models).rerank);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -176,9 +187,9 @@ function formatSearchSummary(results: SearchResultItem[], query: string, rerankS
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
   }
   if (results.some(r => r.rerankTimedOut)) {
-    lines.push('\nNote: the reranker timed out; results are unreranked (RRF order).');
+    lines.push('\nNote: the reranker timed out or failed; results are unreranked (RRF order).');
   } else if (rerankSkipped) {
-    lines.push('\nNote: the reranker is off (QMD_RERANK=off or an earlier rerank hang); results are unreranked (RRF order).');
+    lines.push('\nNote: the reranker is off (QMD_RERANK=off, an earlier rerank hang, or a recent remote rerank failure); results are unreranked (RRF order).');
   }
   return lines.join('\n');
 }
@@ -520,7 +531,7 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 | Goal | Approach |
 |------|----------|
 | General search (recommended) | Pass \`query\` — auto-expanded into typed variants and fused (~20 s; busy answer when queued) |
-| Fast lookup (answers in the same turn) | Pass \`searches\`; both kinds are reranked unless \`rerank: false\` |
+| Fast lookup (answers in the same turn) | Pass \`searches\`; reranked by default when the reranker is remote, \`rerank: false\` skips it |
 | Know exact term/name | \`lex\` only |
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
@@ -554,7 +565,7 @@ Intent-aware lex (C++ performance, not sports):
       inputSchema: z.object({
         query: z.string().optional().describe(
           "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
-          "RRF (reranked unless rerank: false). Query expansion is slow (~20 s) and queued; when the server answers busy, use 'searches'. Mutually exclusive with 'searches'."
+          "RRF (reranked by default when the reranker is remote; rerank: false skips it). Query expansion is slow (~20 s) and queued; when the server answers busy, use 'searches'. Mutually exclusive with 'searches'."
         ),
         searches: z.array(subSearchSchema).max(10).optional().describe(
           "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
@@ -580,9 +591,10 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
-        rerank: z.boolean().optional().default(true).describe(
-          "Rerank results with the reranker (default: true; a billed remote call). Pass false to skip it. " +
-          "The answer says so when results come back unreranked (reranker timed out, hung earlier, or QMD_RERANK=off)."
+        rerank: z.boolean().optional().describe(
+          "Rerank results with the reranker. Default: on when the reranker is remote (a billed call, about 1 s), off when it is a local model (slow). " +
+          "Pass false to skip it, true to force it. The answer says so when results come back unreranked " +
+          "(reranker timed out or failed, hung earlier, or QMD_RERANK=off)."
         ),
       }),
     },
@@ -612,6 +624,9 @@ Intent-aware lex (C++ performance, not sports):
 
       // Use default collections if none specified
       const effectiveCollections = collections ?? defaultCollectionNames;
+
+      // Unset means on for a remote reranker only: a local one can take minutes on a cold load.
+      const doRerank = rerank ?? rerankIsRemote(store);
 
       // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
       // `searches` runs the caller's typed sub-queries directly.
@@ -660,7 +675,7 @@ Intent-aware lex (C++ performance, not sports):
           limit,
           minScore,
           candidateLimit,
-          rerank,
+          rerank: doRerank,
           intent,
         });
       } finally {
@@ -693,7 +708,7 @@ Intent-aware lex (C++ performance, not sports):
       });
 
       // Asked to rerank but the reranker is switched off or remembered as hung: say so.
-      const rerankSkipped = rerank && (isRerankDisabled() || isRerankHangRemembered());
+      const rerankSkipped = doRerank && (isRerankDisabled() || isRerankHangRemembered() || isRerankBreakerOpen());
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery, rerankSkipped) }],

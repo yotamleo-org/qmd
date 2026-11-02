@@ -340,13 +340,33 @@ export function isRerankDisabled(): boolean {
 }
 
 const DEFAULT_RERANK_TIMEOUT_MS = 60_000;
+// A remote reranker answers in about a second (max 5.1 s over 75 searches, HIMMEL-8747),
+// and an inline search waits on it, so it gets a much shorter budget than a native call.
+const DEFAULT_REMOTE_RERANK_TIMEOUT_MS = 15_000;
 const MAX_TIMER_MS = 2_147_483_647;
 
 /** Budget for the rerank scoring itself (model load excluded). Override with QMD_RERANK_TIMEOUT_MS. */
-export function resolveRerankTimeoutMs(): number {
+export function resolveRerankTimeoutMs(remote = false): number {
   const raw = Number(process.env.QMD_RERANK_TIMEOUT_MS);
   // setTimeout clamps anything above 2^31-1 ms to 1 ms, which would time out instantly.
-  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_TIMEOUT_MS;
+  if (Number.isFinite(raw) && raw > 0) return Math.min(raw, MAX_TIMER_MS);
+  return remote ? DEFAULT_REMOTE_RERANK_TIMEOUT_MS : DEFAULT_RERANK_TIMEOUT_MS;
+}
+
+const DEFAULT_RERANK_BREAKER_MS = 60_000;
+let rerankBreakerUntil = 0;
+
+/** A remote reranker that failed or hung stays skipped for this long (QMD_RERANK_BREAKER_MS, default 60 s), so queued searches do not each wait out its budget. */
+export function tripRerankBreaker(): void {
+  const raw = Number(process.env.QMD_RERANK_BREAKER_MS);
+  const ttl = Number.isFinite(raw) && raw >= 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_BREAKER_MS;
+  rerankBreakerUntil = Date.now() + ttl;
+}
+export function isRerankBreakerOpen(): boolean {
+  return Date.now() < rerankBreakerUntil;
+}
+export function resetRerankBreakerForTests(): void {
+  rerankBreakerUntil = 0;
 }
 
 const DEFAULT_RERANK_LOAD_TIMEOUT_MS = 600_000;
