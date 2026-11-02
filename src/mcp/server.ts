@@ -1505,6 +1505,7 @@ export async function startMcpHttpServer(
             context: r.context,
             ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
             ...(r.rerankTimedOut ? { rerankTimedOut: true as const } : {}),
+            ...(r.rerankSkipped ? { rerankSkipped: true as const } : {}),
             line,
             snippet: addLineNumbers(snippet, line),
           };

@@ -44,7 +44,7 @@ import {
   isRerankBreakerOpen, markLlamaPoisonedForTests, resetLlamaPoisonedForTests, resetRerankBreakerForTests, tripRerankBreaker,
 } from "../src/llm.ts";
 
-type Mode = "ok" | "400" | "401" | "500" | "hang" | "empty";
+type Mode = "ok" | "400" | "401" | "429" | "500" | "hang" | "empty" | "partial" | "reset";
 const PROVIDER_DETAIL = "provider-detail-must-not-be-logged";
 type Rpc = { result?: Record<string, any> };
 
@@ -113,6 +113,8 @@ describe("query tool: a failing rerank never fails the search", () => {
       req.on("data", c => { body += c; });
       req.on("end", () => {
         if (mode === "hang") return; // never answers
+        if (mode === "reset") { req.socket.destroy(); return; } // a network error
+        if (mode === "partial") { res.writeHead(200, { "content-type": "application/json" }).end('{"results":[{"index":0,"relevance_score":0.9}]}'); return; } // 1 of 2 scored
         if (mode === "empty") { res.writeHead(200, { "content-type": "application/json" }).end('{"results":[]}'); return; }
         if (mode !== "ok") { res.writeHead(Number(mode), { "content-type": "application/json" }).end(`{"error":"${PROVIDER_DETAIL}"}`); return; }
         const n = (JSON.parse(body).documents as unknown[]).length;
@@ -203,18 +205,69 @@ describe("query tool: a failing rerank never fails the search", () => {
     expect(res.result?.content[0].text).not.toMatch(/unreranked/);
   });
 
-  test("a 400 answers one request and does not open the breaker; a 500 does", async () => {
-    mode = "400";
+  for (const status of ["400", "429"] as const) {
+    test(`a ${status} answers one request and does not open the breaker; a 500 does`, async () => {
+      mode = status;
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      await start("remote");
+      const first = await rpc(handle.port, searchArgs);
+      expect(first.result?.content[0].text).toMatch(/unreranked/);
+      expect(isRerankBreakerOpen()).toBe(false);
+      await rpc(handle.port, searchArgs);
+      expect(rerankCalls).toBe(2); // asked again
+      mode = "500";
+      await rpc(handle.port, searchArgs);
+      expect(isRerankBreakerOpen()).toBe(true);
+    });
+  }
+
+  test("a network error answers unreranked and opens the breaker", async () => {
+    mode = "reset";
     vi.spyOn(console, "error").mockImplementation(() => {});
     await start("remote");
-    const first = await rpc(handle.port, searchArgs);
-    expect(first.result?.content[0].text).toMatch(/unreranked/);
-    expect(isRerankBreakerOpen()).toBe(false);
-    await rpc(handle.port, searchArgs);
-    expect(rerankCalls).toBe(2); // asked again
-    mode = "500";
-    await rpc(handle.port, searchArgs);
+    const res = await rpc(handle.port, searchArgs);
+    expect(res.result?.isError).toBeUndefined();
+    expect(res.result?.structuredContent.results.every((r: any) => r.rerankTimedOut === true)).toBe(true);
+    expect(res.result?.content[0].text).toMatch(/unreranked/);
     expect(isRerankBreakerOpen()).toBe(true);
+  });
+
+  test("a remote 200 that scores only some of the documents is flagged unreranked", async () => {
+    mode = "partial";
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await start("remote");
+    const res = await rpc(handle.port, searchArgs);
+    expect(res.result?.structuredContent.results.length).toBe(2);
+    expect(res.result?.structuredContent.results.every((r: any) => r.rerankTimedOut === true)).toBe(true);
+    expect(res.result?.content[0].text).toMatch(/unreranked/);
+  });
+
+  test("REST /query forwards rerankSkipped when the breaker is open, and never asks the reranker", async () => {
+    await start("remote");
+    tripRerankBreaker();
+    const res = await fetch(`http://localhost:${handle.port}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(searchArgs),
+    });
+    const body = (await res.json()) as { results: Array<Record<string, unknown>> };
+    expect(res.status).toBe(200);
+    expect(body.results.length).toBe(2);
+    expect(body.results.every(r => r.rerankSkipped === true)).toBe(true);
+    expect(rerankCalls).toBe(0);
+  });
+
+  test("REST /query reports a reranker failure with rerankTimedOut, and a healthy rerank carries no flag", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await start("remote");
+    // The intent is part of the rerank cache key: a second query text keeps the failing call off the cache.
+    const post = async (intent: string) => ((await (await fetch(`http://localhost:${handle.port}/query`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...searchArgs, intent }),
+    })).json()) as { results: Array<Record<string, unknown>> }).results;
+    const healthy = await post("first");
+    expect(healthy.some(r => r.rerankSkipped || r.rerankTimedOut)).toBe(false);
+    mode = "500";
+    expect((await post("second")).every(r => r.rerankTimedOut === true)).toBe(true);
   });
 
   test("a remote 200 with no results is flagged unreranked, not read as reranked", async () => {
