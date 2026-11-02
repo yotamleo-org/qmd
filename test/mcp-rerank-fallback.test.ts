@@ -3,7 +3,7 @@
  * search. Real store, real indexed collection, a real HTTP stub for the remote /rerank
  * endpoint (store.search is not stubbed).
  */
-import { describe, test, expect, afterEach, beforeEach, vi } from "vitest";
+import { describe, test, expect, afterAll, afterEach, beforeEach, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,32 +11,24 @@ import { join } from "node:path";
 
 // llm.ts reads the rerank-hung marker once at import: point it at an empty dir first, so a real
 // marker under the user's cache neither skips the reranker here nor is written by these tests.
-vi.hoisted(() => {
+const originalCacheHome = vi.hoisted(() => {
   const { mkdtempSync } = require("node:fs") as typeof import("node:fs");
   const { tmpdir } = require("node:os") as typeof import("node:os");
   const { join } = require("node:path") as typeof import("node:path");
+  const original = process.env.XDG_CACHE_HOME;
   process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), "qmd-rerank-fb-cache-"));
+  return original;
 });
-// Runs between a search's decision to skip the reranker and the tool's answer: lets a row move the
-// breaker's clock in that window. Everything else reaches the real store.
-const afterSearch = vi.hoisted(() => ({ fn: null as null | (() => void) }));
-// oxlint-disable-next-line anti-slop/no-module-mocking -- store.search has no seam between its decision and its return, HIMMEL-5938
-vi.mock("../src/index.js", async (importOriginal) => {
-  const mod = await importOriginal<typeof import("../src/index.js")>();
-  return {
-    ...mod,
-    createStore: async (...args: Parameters<typeof mod.createStore>) => {
-      const store = await mod.createStore(...args);
-      const realSearch = store.search.bind(store);
-      store.search = (async (opts: Parameters<typeof realSearch>[0]) => {
-        const found = await realSearch(opts);
-        afterSearch.fn?.();
-        return found;
-      }) as typeof realSearch;
-      return store;
-    },
-  };
+// Bun runs every test file in one process: give the cache home back for the files after this one.
+afterAll(() => {
+  if (originalCacheHome !== undefined) process.env.XDG_CACHE_HOME = originalCacheHome; else delete process.env.XDG_CACHE_HOME;
 });
+
+// Put the environment back key by key: assigning a new object detaches it from child processes under Bun.
+function restoreEnv(snapshot: NodeJS.ProcessEnv) {
+  for (const key of Object.keys(process.env)) if (!(key in snapshot)) delete process.env[key];
+  Object.assign(process.env, snapshot);
+}
 import { createStore } from "../src/index.ts";
 import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server.ts";
 import { _resetProductionModeForTesting, rerank } from "../src/store.ts";
@@ -78,6 +70,7 @@ describe("query tool: a failing rerank never fails the search", () => {
   let stub: Server;
   let mode: Mode;
   let rerankCalls: number;
+  let chatDelayMs: number;
   let handle: HttpServerHandle;
   const saved = { ...process.env };
 
@@ -106,9 +99,15 @@ describe("query tool: a failing rerank never fails the search", () => {
     dir = mkdtempSync(join(tmpdir(), "qmd-rerank-fb-"));
     mode = "ok";
     rerankCalls = 0;
+    chatDelayMs = 0;
     resetRerankBreakerForTests();
     stub = createServer((req, res) => {
-      if (!req.url?.endsWith("/rerank")) { res.writeHead(404).end(); return; }
+      if (!req.url?.endsWith("/rerank")) {
+        // Query expansion (/chat/completions) answers 404 after chatDelayMs: widens a plain query's window.
+        const wait = req.url?.endsWith("/chat/completions") ? chatDelayMs : 0;
+        setTimeout(() => res.writeHead(404).end(), wait);
+        return;
+      }
       rerankCalls++;
       let body = "";
       req.on("data", c => { body += c; });
@@ -132,9 +131,8 @@ describe("query tool: a failing rerank never fails the search", () => {
     _resetProductionModeForTesting();
     resetLlamaPoisonedForTests();
     resetRerankBreakerForTests();
-    afterSearch.fn = null;
     vi.restoreAllMocks();
-    process.env = { ...saved };
+    restoreEnv(saved);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -188,10 +186,11 @@ describe("query tool: a failing rerank never fails the search", () => {
   }
 
   test("a breaker that expires while the search runs: the answer still says the search skipped the reranker", async () => {
+    process.env.QMD_RERANK_BREAKER_MS = "150";
+    chatDelayMs = 300; // the plain query's expansion outlasts the breaker
     await start("remote");
     tripRerankBreaker(STUB_MODEL);
-    afterSearch.fn = resetRerankBreakerForTests; // the breaker closes after the search decided to skip
-    const res = await rpc(handle.port, searchArgs);
+    const res = await rpc(handle.port, { query: "alpha" });
     expect(rerankCalls).toBe(0);
     expect(res.result?.structuredContent.rerankSkipped).toBe(true);
     expect(res.result?.content[0].text).toMatch(/unreranked/);
@@ -207,9 +206,10 @@ describe("query tool: a failing rerank never fails the search", () => {
   });
 
   test("a breaker that opens while the search runs does not call a reranked answer unreranked", async () => {
+    chatDelayMs = 300;
     await start("remote");
-    afterSearch.fn = () => tripRerankBreaker(STUB_MODEL); // opens after the search already reranked
-    const res = await rpc(handle.port, searchArgs);
+    setTimeout(() => tripRerankBreaker(STUB_MODEL), 100); // opens after the search decided to rerank
+    const res = await rpc(handle.port, { query: "alpha" });
     expect(rerankCalls).toBe(1);
     expect(res.result?.structuredContent.rerankSkipped).toBeUndefined();
     expect(res.result?.content[0].text).not.toMatch(/unreranked/);
