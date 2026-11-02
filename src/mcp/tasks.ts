@@ -69,14 +69,16 @@ function errorResult(message: string) {
  * and the call answers `resultType: "task"`; without it the handler runs as-is.
  * A handler that throws ends the task `completed` with the same error result
  * the SDK gives a synchronous call. `track` keeps the background run visible to
- * the stdio EOF shutdown.
+ * the stdio EOF shutdown. `slow` picks the calls worth a task: one it rejects
+ * runs as-is even for a client with the extension.
  */
 export function withTask<A, C extends ToolCallContext, R>(
   handler: (args: A, ctx: C) => Promise<R>,
   track: <T extends (...args: never[]) => unknown>(fn: T) => T,
+  slow: (args: A) => boolean = () => true,
 ): (args: A, ctx: C) => Promise<R> {
   return async (args, ctx) => {
-    if (!clientWantsTask(ctx)) return handler(args, ctx);
+    if (!clientWantsTask(ctx) || !slow(args)) return handler(args, ctx);
     sweep(Date.now());
     // At the cap of live handlers the call just runs synchronously, as for a client without the extension.
     if (liveHandlers >= MAX_TASKS) return handler(args, ctx);

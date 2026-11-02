@@ -36,7 +36,9 @@ function envelope(withTasks: boolean) {
 
 type Rpc = { result?: Record<string, any>; error?: { code: number; message: string; data?: Record<string, any> } };
 
-const queryArgs = { searches: [{ type: "lex", query: "alpha" }] };
+// Only a plain `query` (slow query expansion) becomes a task; typed `searches` answer inline (HIMMEL-8747).
+const queryArgs = { query: "alpha" };
+const searchArgs = { searches: [{ type: "lex", query: "alpha" }] };
 
 describe("query tool as an MCP task — HTTP", () => {
   let handle: HttpServerHandle;
@@ -92,6 +94,40 @@ describe("query tool as an MCP task — HTTP", () => {
     expect(res.result?.taskId).toBeUndefined();
     expect(res.result?.structuredContent.results).toHaveLength(1);
     expect(res.result?.content[0].text).toContain("notes/alpha.md");
+  });
+
+  test("with the extension, typed searches answer inline and rerank is on by default", async () => {
+    open(); release();
+    const seen: Array<Record<string, unknown>> = [];
+    const prior = searchStub.fn;
+    searchStub.fn = async (opts) => { seen.push(opts as Record<string, unknown>); return prior!(opts); };
+    try {
+      const res = await rpc("tools/call", { name: "query", arguments: searchArgs }, true);
+      expect(res.result?.resultType).toBe("complete");
+      expect(res.result?.taskId).toBeUndefined();
+      expect(res.result?.structuredContent.results).toHaveLength(1);
+      expect(seen[0]?.rerank).toBe(true);
+      const off = await rpc("tools/call", { name: "query", arguments: { ...searchArgs, rerank: false } }, true);
+      expect(off.result?.resultType).toBe("complete");
+      expect(seen[1]?.rerank).toBe(false);
+    } finally {
+      searchStub.fn = prior;
+    }
+  });
+
+  test("QMD_RERANK=off: the answer says the results are unreranked", async () => {
+    open(); release();
+    const prior = process.env.QMD_RERANK;
+    process.env.QMD_RERANK = "off";
+    try {
+      const res = await rpc("tools/call", { name: "query", arguments: searchArgs }, true);
+      expect(res.result?.content[0].text).toMatch(/unreranked/);
+      expect(res.result?.structuredContent.rerankSkipped).toBe(true);
+      const asked = await rpc("tools/call", { name: "query", arguments: { ...searchArgs, rerank: false } }, true);
+      expect(asked.result?.content[0].text).not.toMatch(/unreranked/);
+    } finally {
+      if (prior !== undefined) process.env.QMD_RERANK = prior; else delete process.env.QMD_RERANK;
+    }
   });
 
   test("with the extension the call returns a task at once and tasks/get reaches complete with the same result", async () => {
@@ -226,11 +262,19 @@ describe("query tool as an MCP task — stdio", () => {
     });
   }
 
-  test("tasks extension: task at once, tasks/get completes with the synchronous result; without it unchanged", async () => {
-    const sync = await rpc("tools/call", { name: "query", arguments: queryArgs }, false);
+  test("tasks extension: typed searches answer inline with the same result as without it", async () => {
+    const sync = await rpc("tools/call", { name: "query", arguments: searchArgs }, false);
     expect(sync.result?.resultType).toBe("complete");
     expect(sync.result?.structuredContent).toEqual({ results: [] });
 
+    const inline = await rpc("tools/call", { name: "query", arguments: searchArgs }, true);
+    expect(inline.result?.resultType).toBe("complete");
+    expect(inline.result?.taskId).toBeUndefined();
+    expect(inline.result?.structuredContent).toEqual(sync.result?.structuredContent);
+    expect(inline.result?.content).toEqual(sync.result?.content);
+  }, 60_000);
+
+  test("tasks extension: a plain query returns a task at once and tasks/get completes it", async () => {
     const created = await rpc("tools/call", { name: "query", arguments: queryArgs }, true);
     expect(created.result?.resultType).toBe("task");
     let done: Rpc = created;
@@ -238,8 +282,7 @@ describe("query tool as an MCP task — stdio", () => {
       done = await rpc("tasks/get", { taskId: created.result!.taskId }, true);
       expect(done.result?.status).toBe("completed");
     }, { timeout: 30_000 });
-    expect(done.result?.result.structuredContent).toEqual(sync.result?.structuredContent);
-    expect(done.result?.result.content).toEqual(sync.result?.content);
+    expect(done.result?.taskId).toBe(created.result!.taskId);
   }, 60_000);
 
   test("a 2025-era initialize session gets the synchronous result", async () => {
@@ -247,7 +290,7 @@ describe("query tool as an MCP task — stdio", () => {
       protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "legacy", version: "1.0.0" },
     }, null);
     expect(init.result?.protocolVersion).toBe("2025-06-18");
-    const res = await rpc("tools/call", { name: "query", arguments: queryArgs }, null);
+    const res = await rpc("tools/call", { name: "query", arguments: searchArgs }, null);
     expect(res.result?.taskId).toBeUndefined();
     expect(res.result?.resultType).not.toBe("task");
     expect(res.result?.structuredContent).toEqual({ results: [] });

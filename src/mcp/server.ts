@@ -38,7 +38,7 @@ import {
 import { getConfigPath, loadConfig } from "../collections.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode, isDocid } from "../store.js";
-import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels } from "../llm.js";
+import { isLlamaPoisoned, killProcessNow, isOpenAiModelUri, recordRerankHang, resolveModels, isRerankDisabled, isRerankHangRemembered } from "../llm.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { checkBearer } from "./auth.js";
 import { validateMcpGlobPattern, MCP_GLOB_MAX_LENGTH } from "./glob-guard.js";
@@ -167,7 +167,7 @@ function encodeQmdPath(path: string): string {
 /**
  * Format search results as human-readable text summary
  */
-function formatSearchSummary(results: SearchResultItem[], query: string): string {
+function formatSearchSummary(results: SearchResultItem[], query: string, rerankSkipped = false): string {
   if (results.length === 0) {
     return `No results found for "${query}"`;
   }
@@ -177,6 +177,8 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   }
   if (results.some(r => r.rerankTimedOut)) {
     lines.push('\nNote: the reranker timed out; results are unreranked (RRF order).');
+  } else if (rerankSkipped) {
+    lines.push('\nNote: the reranker is off (QMD_RERANK=off or an earlier rerank hang); results are unreranked (RRF order).');
   }
   return lines.join('\n');
 }
@@ -517,7 +519,8 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 
 | Goal | Approach |
 |------|----------|
-| General search (recommended) | Pass \`query\` — auto-expanded into typed variants and fused (~20 s; busy answer when queued); add \`rerank: true\` to rerank |
+| General search (recommended) | Pass \`query\` — auto-expanded into typed variants and fused (~20 s; busy answer when queued) |
+| Fast lookup (answers in the same turn) | Pass \`searches\`; both kinds are reranked unless \`rerank: false\` |
 | Know exact term/name | \`lex\` only |
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
@@ -551,7 +554,7 @@ Intent-aware lex (C++ performance, not sports):
       inputSchema: z.object({
         query: z.string().optional().describe(
           "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
-          "RRF (reranked only with rerank: true). Query expansion is slow (~20 s) and queued; when the server answers busy, use 'searches'. Mutually exclusive with 'searches'."
+          "RRF (reranked unless rerank: false). Query expansion is slow (~20 s) and queued; when the server answers busy, use 'searches'. Mutually exclusive with 'searches'."
         ),
         searches: z.array(subSearchSchema).max(10).optional().describe(
           "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
@@ -577,11 +580,13 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
-        rerank: z.boolean().optional().default(false).describe(
-          "Rerank results with the reranker (default: false; adds ~20 s and a billed remote call). Pass true to opt in."
+        rerank: z.boolean().optional().default(true).describe(
+          "Rerank results with the reranker (default: true; a billed remote call). Pass false to skip it. " +
+          "The answer says so when results come back unreranked (reranker timed out, hung earlier, or QMD_RERANK=off)."
         ),
       }),
     },
+    // Only a plain `query` (slow query expansion) is worth a task; typed `searches` answer in the same turn.
     track(withTask(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }, extra) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
@@ -687,11 +692,14 @@ Intent-aware lex (C++ performance, not sports):
         };
       });
 
+      // Asked to rerank but the reranker is switched off or remembered as hung: say so.
+      const rerankSkipped = rerank && (isRerankDisabled() || isRerankHangRemembered());
+
       return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
-        structuredContent: { results: filtered },
+        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery, rerankSkipped) }],
+        structuredContent: { results: filtered, ...(rerankSkipped ? { rerankSkipped: true as const } : {}) },
       };
-    }, track))
+    }, track, args => !!args.query))
   );
 
   // The extension's status poll and cancel; tasks created by any server instance answer here.
