@@ -358,9 +358,24 @@ let rerankBreakerUntil = 0;
 
 /** A remote reranker that failed or hung stays skipped for this long (QMD_RERANK_BREAKER_MS, default 60 s), so queued searches do not each wait out its budget. */
 export function tripRerankBreaker(): void {
-  const raw = Number(process.env.QMD_RERANK_BREAKER_MS);
+  // Unset or empty means the default; only an explicit 0 turns the breaker off.
+  const text = process.env.QMD_RERANK_BREAKER_MS?.trim();
+  const raw = text ? Number(text) : NaN;
   const ttl = Number.isFinite(raw) && raw >= 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_BREAKER_MS;
   rerankBreakerUntil = Date.now() + ttl;
+}
+
+/** What a rerank failure may say in a log line: the status or kind, never the provider's response text. */
+export function rerankFailureLabel(err: unknown): string {
+  if (err instanceof HttpStatusError) return `HTTP ${err.status}`;
+  if (err instanceof RerankTimeoutError) return "timed out";
+  return err instanceof Error ? err.name : "unknown error";
+}
+
+/** A 4xx answers for one request (bad input, one 429); a timeout, 5xx, network or malformed answer means the reranker is down. */
+export function failureTripsRerankBreaker(err: unknown): boolean {
+  if (err instanceof HttpStatusError) return err.status >= 500;
+  return true;
 }
 export function isRerankBreakerOpen(): boolean {
   return Date.now() < rerankBreakerUntil;
