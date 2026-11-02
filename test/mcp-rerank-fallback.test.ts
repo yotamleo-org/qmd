@@ -147,10 +147,10 @@ describe("query tool: a failing rerank never fails the search", () => {
   });
 
   // Both halves of the store: typed searches reach structuredSearch, a plain query reaches hybridQuery.
-  const shapes = { "typed searches": searchArgs, "a plain query": { query: "alpha" } };
-  for (const [shape, args] of Object.entries(shapes)) {
+  const callers = { "typed searches": searchArgs, "a plain query": { query: "alpha" } };
+  for (const [caller, args] of Object.entries(callers)) {
     for (const status of ["401", "500"] as const) {
-      test(`${shape}: a ${status} from the remote reranker answers unreranked with a note and a flag, not an error`, async () => {
+      test(`${caller}: a ${status} from the remote reranker answers unreranked with a note and a flag, not an error`, async () => {
         mode = status;
         const logged = vi.spyOn(console, "error").mockImplementation(() => {});
         await start("remote");
@@ -166,7 +166,7 @@ describe("query tool: a failing rerank never fails the search", () => {
       });
     }
 
-    test(`${shape}: a process poisoned by an earlier hang skips the reranker and the answer says so`, async () => {
+    test(`${caller}: a process poisoned by an earlier hang skips the reranker and the answer says so`, async () => {
       await start("remote");
       markLlamaPoisonedForTests();
       const res = await rpc(handle.port, args);
@@ -175,7 +175,7 @@ describe("query tool: a failing rerank never fails the search", () => {
       expect(res.result?.content[0].text).toMatch(/unreranked/);
     });
 
-    test(`${shape}: an open breaker skips the reranker and the answer says so`, async () => {
+    test(`${caller}: an open breaker skips the reranker and the answer says so`, async () => {
       await start("remote");
       tripRerankBreaker();
       const res = await rpc(handle.port, args);
