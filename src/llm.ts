@@ -340,13 +340,49 @@ export function isRerankDisabled(): boolean {
 }
 
 const DEFAULT_RERANK_TIMEOUT_MS = 60_000;
+// A remote reranker answers in about a second (max 5.1 s over 75 searches, HIMMEL-8747),
+// and an inline search waits on it, so it gets a much shorter budget than a native call.
+const DEFAULT_REMOTE_RERANK_TIMEOUT_MS = 15_000;
 const MAX_TIMER_MS = 2_147_483_647;
 
 /** Budget for the rerank scoring itself (model load excluded). Override with QMD_RERANK_TIMEOUT_MS. */
-export function resolveRerankTimeoutMs(): number {
+export function resolveRerankTimeoutMs(remote = false): number {
   const raw = Number(process.env.QMD_RERANK_TIMEOUT_MS);
   // setTimeout clamps anything above 2^31-1 ms to 1 ms, which would time out instantly.
-  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_TIMEOUT_MS;
+  if (Number.isFinite(raw) && raw > 0) return Math.min(raw, MAX_TIMER_MS);
+  return remote ? DEFAULT_REMOTE_RERANK_TIMEOUT_MS : DEFAULT_RERANK_TIMEOUT_MS;
+}
+
+const DEFAULT_RERANK_BREAKER_MS = 60_000;
+// One breaker per reranker model: a failing remote reranker never switches off another store's.
+const rerankBreakerUntil = new Map<string, number>();
+
+/** A remote reranker that failed or hung stays skipped for this long (QMD_RERANK_BREAKER_MS, default 60 s), so queued searches do not each wait out its budget. */
+export function tripRerankBreaker(model: string): void {
+  // Unset or empty means the default; only an explicit 0 turns the breaker off.
+  const text = process.env.QMD_RERANK_BREAKER_MS?.trim();
+  const raw = text ? Number(text) : NaN;
+  const ttl = Number.isFinite(raw) && raw >= 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_RERANK_BREAKER_MS;
+  rerankBreakerUntil.set(model, Date.now() + ttl);
+}
+
+/** What a rerank failure may say in a log line: the status or kind, never the provider's response text. */
+export function rerankFailureLabel(err: unknown): string {
+  if (err instanceof HttpStatusError) return `HTTP ${err.status}`;
+  if (err instanceof RerankTimeoutError) return "timed out";
+  return err instanceof Error ? err.name : "unknown error";
+}
+
+/** A 4xx answers for one request (bad input, one 429); a timeout, 5xx, network or malformed answer means the reranker is down. */
+export function failureTripsRerankBreaker(err: unknown): boolean {
+  if (err instanceof HttpStatusError) return err.status >= 500;
+  return true;
+}
+export function isRerankBreakerOpen(model: string | undefined): boolean {
+  return model !== undefined && Date.now() < (rerankBreakerUntil.get(model) ?? 0);
+}
+export function resetRerankBreakerForTests(): void {
+  rerankBreakerUntil.clear();
 }
 
 const DEFAULT_RERANK_LOAD_TIMEOUT_MS = 600_000;

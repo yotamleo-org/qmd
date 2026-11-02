@@ -73,6 +73,17 @@ export function exitIfRerankHung(store?: QMDStore): void {
   console.error("QMD: rerank (or its model load) timed out; serving unreranked results from now on (QMD_RERANK=off skips the reranker at startup)");
 }
 
+/** True when the reranker is an `openai:` model: it answers in about a second and has no native state. */
+function rerankIsRemote(store?: QMDStore): boolean {
+  const llm = store?.internal.llm;
+  if (llm) return isOpenAiModelUri(llm.rerankModelName);
+  try {
+    return isOpenAiModelUri(resolveModels(loadConfig().models).rerank);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * True when embedding or query expansion still runs on the local (poisoned) llama instance.
  * The store's effective models win: createStore may replace the raw config's models with defaults.
@@ -167,7 +178,7 @@ function encodeQmdPath(path: string): string {
 /**
  * Format search results as human-readable text summary
  */
-function formatSearchSummary(results: SearchResultItem[], query: string): string {
+function formatSearchSummary(results: SearchResultItem[], query: string, rerankSkipped = false): string {
   if (results.length === 0) {
     return `No results found for "${query}"`;
   }
@@ -176,7 +187,9 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
   }
   if (results.some(r => r.rerankTimedOut)) {
-    lines.push('\nNote: the reranker timed out; results are unreranked (RRF order).');
+    lines.push('\nNote: the reranker timed out or failed; results are unreranked (RRF order).');
+  } else if (rerankSkipped) {
+    lines.push('\nNote: the reranker is off (QMD_RERANK=off, an earlier rerank hang, or a recent remote rerank failure); results are unreranked (RRF order).');
   }
   return lines.join('\n');
 }
@@ -517,7 +530,8 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 
 | Goal | Approach |
 |------|----------|
-| General search (recommended) | Pass \`query\` — auto-expanded into typed variants and fused (~20 s; busy answer when queued); add \`rerank: true\` to rerank |
+| General search (recommended) | Pass \`query\` — auto-expanded into typed variants and fused (~20 s; busy answer when queued) |
+| Fast lookup (answers in the same turn) | Pass \`searches\`; reranked by default when the reranker is remote, \`rerank: false\` skips it |
 | Know exact term/name | \`lex\` only |
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
@@ -551,7 +565,7 @@ Intent-aware lex (C++ performance, not sports):
       inputSchema: z.object({
         query: z.string().optional().describe(
           "Plain-text query, auto-expanded by the SDK into lex/vec/hyde variants, fused via " +
-          "RRF (reranked only with rerank: true). Query expansion is slow (~20 s) and queued; when the server answers busy, use 'searches'. Mutually exclusive with 'searches'."
+          "RRF (reranked by default when the reranker is remote; rerank: false skips it). Query expansion is slow (~20 s) and queued; when the server answers busy, use 'searches'. Mutually exclusive with 'searches'."
         ),
         searches: z.array(subSearchSchema).max(10).optional().describe(
           "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. Use for precise " +
@@ -577,11 +591,14 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
-        rerank: z.boolean().optional().default(false).describe(
-          "Rerank results with the reranker (default: false; adds ~20 s and a billed remote call). Pass true to opt in."
+        rerank: z.boolean().optional().describe(
+          "Rerank results with the reranker. Default: on when the reranker is remote (a billed call, about 1 s), off when it is a local model (slow). " +
+          "Pass false to skip it, true to force it. The answer says so when results come back unreranked " +
+          "(reranker timed out or failed, hung earlier, or QMD_RERANK=off)."
         ),
       }),
     },
+    // Only a plain `query` (slow query expansion) is worth a task; typed `searches` answer in the same turn.
     track(withTask(async ({ query, searches, limit, minScore, candidateLimit, collections, filter, intent, rerank }, extra) => {
       // Require exactly one of `query` (plain text, auto-expanded) or `searches` (typed sub-queries).
       if (!query && (!searches || searches.length === 0)) {
@@ -607,6 +624,9 @@ Intent-aware lex (C++ performance, not sports):
 
       // Use default collections if none specified
       const effectiveCollections = collections ?? defaultCollectionNames;
+
+      // Unset means on for a remote reranker only: a local one can take minutes on a cold load.
+      const doRerank = rerank ?? rerankIsRemote(store);
 
       // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
       // `searches` runs the caller's typed sub-queries directly.
@@ -655,7 +675,7 @@ Intent-aware lex (C++ performance, not sports):
           limit,
           minScore,
           candidateLimit,
-          rerank,
+          rerank: doRerank,
           intent,
         });
       } finally {
@@ -687,11 +707,14 @@ Intent-aware lex (C++ performance, not sports):
         };
       });
 
+      // The search itself says when it skipped the reranker the caller wanted (off, hung, breaker open).
+      const rerankSkipped = results.some(r => r.rerankSkipped);
+
       return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
-        structuredContent: { results: filtered },
+        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery, rerankSkipped) }],
+        structuredContent: { results: filtered, ...(rerankSkipped ? { rerankSkipped: true as const } : {}) },
       };
-    }, track))
+    }, track, args => !!args.query))
   );
 
   // The extension's status poll and cancel; tasks created by any server instance answer here.
@@ -1482,6 +1505,7 @@ export async function startMcpHttpServer(
             context: r.context,
             ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
             ...(r.rerankTimedOut ? { rerankTimedOut: true as const } : {}),
+            ...(r.rerankSkipped ? { rerankSkipped: true as const } : {}),
             line,
             snippet: addLineNumbers(snippet, line),
           };
