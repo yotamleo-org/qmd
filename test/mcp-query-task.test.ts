@@ -116,21 +116,6 @@ describe("query tool as an MCP task — HTTP", () => {
     }
   });
 
-  test("QMD_RERANK=off: the answer says the results are unreranked", async () => {
-    open(); release();
-    const prior = process.env.QMD_RERANK;
-    process.env.QMD_RERANK = "off";
-    try {
-      const res = await rpc("tools/call", { name: "query", arguments: searchArgs }, true);
-      expect(res.result?.content[0].text).toMatch(/unreranked/);
-      expect(res.result?.structuredContent.rerankSkipped).toBe(true);
-      const asked = await rpc("tools/call", { name: "query", arguments: { ...searchArgs, rerank: false } }, true);
-      expect(asked.result?.content[0].text).not.toMatch(/unreranked/);
-    } finally {
-      if (prior !== undefined) process.env.QMD_RERANK = prior; else delete process.env.QMD_RERANK;
-    }
-  });
-
   test("with the extension the call returns a task at once and tasks/get reaches complete with the same result", async () => {
     open(); release();
     const sync = await rpc("tools/call", { name: "query", arguments: queryArgs }, false);

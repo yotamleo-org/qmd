@@ -265,6 +265,18 @@ describe("query tool: a failing rerank never fails the search", () => {
     expect(res.result?.structuredContent.rerankSkipped).toBeUndefined();
   });
 
+  test("QMD_RERANK=off: the answer says the results are unreranked, and rerank:false does not", async () => {
+    await start("remote");
+    process.env.QMD_RERANK = "off";
+    const res = await rpc(handle.port, searchArgs);
+    expect(rerankCalls).toBe(0);
+    expect(res.result?.structuredContent.rerankSkipped).toBe(true);
+    expect(res.result?.content[0].text).toMatch(/unreranked/);
+    const asked = await rpc(handle.port, { ...searchArgs, rerank: false });
+    expect(asked.result?.structuredContent.rerankSkipped).toBeUndefined();
+    expect(asked.result?.content[0].text).not.toMatch(/unreranked/);
+  });
+
   test("a process poisoned by an earlier hang says the results are unreranked", async () => {
     await start("remote");
     markLlamaPoisonedForTests();
