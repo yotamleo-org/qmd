@@ -192,7 +192,7 @@ function formatSearchSummary(results: SearchResultItem[], query: string, rerankS
     lines.push('\nNote: the reranker is off (QMD_RERANK=off, an earlier rerank hang, or a recent remote rerank failure); results are unreranked (RRF order).');
   }
   if (embedSkipped) {
-    lines.push('\nNote: the embedding service did not answer in time or is down; the meaning-based part of the search was skipped and these are keyword results.');
+    lines.push('\nNote: the embedding service did not answer in time or is down; the meaning-based part of the search was skipped (or only partly done), so these results lean on keyword matches.');
   }
   return lines.join('\n');
 }

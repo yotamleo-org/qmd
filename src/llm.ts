@@ -387,7 +387,8 @@ export function resetRerankBreakerForTests(): void {
 
 const DEFAULT_EMBED_TIMEOUT_MS = 15_000;
 const DEFAULT_EMBED_BREAKER_MS = 60_000;
-// One breaker per embed model, like the reranker's: a failing remote embedder never switches off another store's.
+// One breaker per embed endpoint and model: a failing remote embedder never switches off another store's,
+// not even one that uses the same model id at a different endpoint.
 const embedBreakerUntil = new Map<string, number>();
 
 /** Budget for one remote QUERY embed request (QMD_EMBED_TIMEOUT_MS, default 15 s). Bulk indexing keeps the 120 s request timeout. */
@@ -2353,7 +2354,8 @@ export class OpenAiLLM implements LLM {
     const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
     // A search waits on its query embed, so it gets a short budget, one attempt and a breaker (like the
     // reranker): a hung or down embedder leaves the vectors null and the search answers with its keyword part.
-    if (options.isQuery && isEmbedBreakerOpen(this.embedModelUri)) return results;
+    const breakerKey = `${this.baseUrl} ${this.embedModelUri}`;
+    if (options.isQuery && isEmbedBreakerOpen(breakerKey)) return results;
     const { batchSize, concurrency } = this.embedTuning;
     const batchCount = Math.ceil(texts.length / batchSize);
     // Bulk embeds on OpenRouter pin one provider with no fallback (a slow one
@@ -2400,7 +2402,7 @@ export class OpenAiLLM implements LLM {
     } catch (error) {
       // A 4xx answers for this request only (bad input, one 429) and still throws; a timeout, 5xx or network error means the embedder is down.
       if (!options.isQuery || !failureTripsRerankBreaker(error)) throw error;
-      tripEmbedBreaker(this.embedModelUri);
+      tripEmbedBreaker(breakerKey);
       console.error(`QMD: embed failed (${rerankFailureLabel(error)}); serving keyword results`);
     }
     return results;
