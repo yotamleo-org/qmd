@@ -178,7 +178,7 @@ function encodeQmdPath(path: string): string {
 /**
  * Format search results as human-readable text summary
  */
-function formatSearchSummary(results: SearchResultItem[], query: string, rerankSkipped = false): string {
+function formatSearchSummary(results: SearchResultItem[], query: string, rerankSkipped = false, embedSkipped = false): string {
   if (results.length === 0) {
     return `No results found for "${query}"`;
   }
@@ -190,6 +190,9 @@ function formatSearchSummary(results: SearchResultItem[], query: string, rerankS
     lines.push('\nNote: the reranker timed out or failed; results are unreranked (RRF order).');
   } else if (rerankSkipped) {
     lines.push('\nNote: the reranker is off (QMD_RERANK=off, an earlier rerank hang, or a recent remote rerank failure); results are unreranked (RRF order).');
+  }
+  if (embedSkipped) {
+    lines.push('\nNote: the embedding service did not answer in time or is down; the meaning-based part of the search was skipped and these are keyword results.');
   }
   return lines.join('\n');
 }
@@ -709,10 +712,16 @@ Intent-aware lex (C++ performance, not sports):
 
       // The search itself says when it skipped the reranker the caller wanted (off, hung, breaker open).
       const rerankSkipped = results.some(r => r.rerankSkipped);
+      // Likewise when the query embed was skipped (hung, down or breaker open): the answer is the keyword part.
+      const embedSkipped = results.some(r => r.embedSkipped);
 
       return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery, rerankSkipped) }],
-        structuredContent: { results: filtered, ...(rerankSkipped ? { rerankSkipped: true as const } : {}) },
+        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery, rerankSkipped, embedSkipped) }],
+        structuredContent: {
+          results: filtered,
+          ...(rerankSkipped ? { rerankSkipped: true as const } : {}),
+          ...(embedSkipped ? { embedSkipped: true as const } : {}),
+        },
       };
     }, track, args => !!args.query))
   );
@@ -1506,6 +1515,7 @@ export async function startMcpHttpServer(
             ...(Object.keys(r.metadata).length > 0 ? { metadata: r.metadata } : {}),
             ...(r.rerankTimedOut ? { rerankTimedOut: true as const } : {}),
             ...(r.rerankSkipped ? { rerankSkipped: true as const } : {}),
+            ...(r.embedSkipped ? { embedSkipped: true as const } : {}),
             line,
             snippet: addLineNumbers(snippet, line),
           };

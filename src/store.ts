@@ -6371,6 +6371,8 @@ export interface HybridQueryResult {
   rerankTimedOut?: true;
   /** Set when the caller wanted a rerank but the reranker was off, remembered as hung or behind an open breaker when the search started. */
   rerankSkipped?: true;
+  /** Set when the query embed was skipped (hung, down or behind an open breaker): the answer is the keyword part only. */
+  embedSkipped?: true;
 }
 
 /**
@@ -6500,6 +6502,7 @@ export async function hybridQuery(
     }
   }
 
+  let embedSkipped = false; // the query embed was skipped or failed: the answer is the keyword part
   // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
   if (hasVectors) {
     const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
@@ -6519,6 +6522,7 @@ export async function hybridQuery(
     const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
+    if (embeddings.some(e => !e)) embedSkipped = true;
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
@@ -6632,6 +6636,7 @@ export async function hybridQuery(
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
           ...(rerankSkipped ? { rerankSkipped: true as const } : {}),
+          ...(embedSkipped ? { embedSkipped: true as const } : {}),
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -6720,6 +6725,7 @@ export async function hybridQuery(
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(rerankTimedOut ? { rerankTimedOut: true as const } : {}),
+      ...(embedSkipped ? { embedSkipped: true as const } : {}),
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
@@ -6925,6 +6931,7 @@ export async function structuredSearch(
     }
   }
 
+  let embedSkipped = false; // the query embed was skipped or failed: the answer is the keyword part
   // Step 2: Batch embed and run vector searches for vec/hyde
   if (hasVectors) {
     const vecSearches = searches.filter(
@@ -6939,6 +6946,7 @@ export async function structuredSearch(
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
+      if (embeddings.some(e => !e)) embedSkipped = true;
 
       for (let i = 0; i < vecSearches.length; i++) {
         const embedding = embeddings[i]?.embedding;
@@ -7045,6 +7053,7 @@ export async function structuredSearch(
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
           ...(rerankSkipped ? { rerankSkipped: true as const } : {}),
+          ...(embedSkipped ? { embedSkipped: true as const } : {}),
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -7132,6 +7141,7 @@ export async function structuredSearch(
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
       ...(rerankTimedOut ? { rerankTimedOut: true as const } : {}),
+      ...(embedSkipped ? { embedSkipped: true as const } : {}),
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
