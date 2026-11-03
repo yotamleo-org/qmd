@@ -385,6 +385,37 @@ export function resetRerankBreakerForTests(): void {
   rerankBreakerUntil.clear();
 }
 
+const DEFAULT_EMBED_TIMEOUT_MS = 15_000;
+const DEFAULT_EMBED_BREAKER_MS = 60_000;
+// One breaker per embed endpoint and model: a failing remote embedder never switches off another store's,
+// not even one that uses the same model id at a different endpoint.
+const embedBreakerUntil = new Map<string, number>();
+
+/** Budget for one remote QUERY embed request (QMD_EMBED_TIMEOUT_MS, default 15 s). Bulk indexing keeps the 120 s request timeout. */
+export function resolveEmbedTimeoutMs(): number {
+  const raw = Number(process.env.QMD_EMBED_TIMEOUT_MS?.trim());
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_EMBED_TIMEOUT_MS;
+}
+
+/** A remote embedder that failed or hung stays skipped for this long (QMD_EMBED_BREAKER_MS, default 60 s; an explicit 0 turns it off). */
+export function tripEmbedBreaker(model: string): void {
+  const text = process.env.QMD_EMBED_BREAKER_MS?.trim();
+  const raw = text ? Number(text) : NaN;
+  const ttl = Number.isFinite(raw) && raw >= 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_EMBED_BREAKER_MS;
+  embedBreakerUntil.set(model, Date.now() + ttl);
+}
+/** A query embed that hit a 429, a 5xx, a timeout or the network is skipped; any other 4xx is the caller's. */
+export function failureTripsEmbedBreaker(err: unknown): boolean {
+  if (err instanceof HttpStatusError) return err.status === 429 || err.status >= 500;
+  return true;
+}
+export function isEmbedBreakerOpen(model: string | undefined): boolean {
+  return model !== undefined && Date.now() < (embedBreakerUntil.get(model) ?? 0);
+}
+export function resetEmbedBreakerForTests(): void {
+  embedBreakerUntil.clear();
+}
+
 const DEFAULT_RERANK_LOAD_TIMEOUT_MS = 600_000;
 
 /** Budget for the rerank model/context load (a cold load can take minutes). Override with QMD_RERANK_LOAD_TIMEOUT_MS. */
@@ -2297,13 +2328,13 @@ export class OpenAiLLM implements LLM {
     return headers;
   }
 
-  private async request<T>(path: string, body?: Record<string, unknown>): Promise<T> {
+  private async request<T>(path: string, body?: Record<string, unknown>, timeoutMs: number = OPENAI_REQUEST_TIMEOUT_MS): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const response = await fetch(url, {
       method: body ? "POST" : "GET",
       headers: this.headers(),
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(OPENAI_REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) {
       const detail = (await response.text().catch(() => "")).slice(0, 300);
@@ -2320,12 +2351,22 @@ export class OpenAiLLM implements LLM {
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     const [result] = await this.embedBatch([text], options);
+    // embedBatch answers a skipped query embed with null so a hybrid search can fall back to its keyword part.
+    // A caller of embed() has no keyword part to fall back to (searchVec, `qmd vsearch`, bench): as before the
+    // breaker, it gets an error, never an empty success.
+    if (!result && options.isQuery) {
+      throw new Error("the remote embedding service did not answer in time or is down; the meaning-based search cannot run (it is skipped for a while after a failure, see QMD_EMBED_BREAKER_MS)");
+    }
     return result ?? null;
   }
 
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     const model = options.model ?? this.embedModelUri;
     const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
+    // A search waits on its query embed, so it gets a short budget, one attempt and a breaker (like the
+    // reranker): a hung or down embedder leaves the vectors null and the search answers with its keyword part.
+    const breakerKey = `${this.baseUrl} ${this.embedModelUri}`;
+    if (options.isQuery && isEmbedBreakerOpen(breakerKey)) return results;
     const { batchSize, concurrency } = this.embedTuning;
     const batchCount = Math.ceil(texts.length / batchSize);
     // Bulk embeds on OpenRouter pin one provider with no fallback (a slow one
@@ -2338,8 +2379,10 @@ export class OpenAiLLM implements LLM {
     // DeepInfra and Nebius), so a stalled pin is retried, never swapped. What an
     // operator needs to see is which provider answered and which attempts failed.
     let nextBatch = 0;
+    // One failed query batch ends the call, so the workers still running claim no further batch (and send no further request).
+    let queryFailed = false;
     const worker = async () => {
-      while (nextBatch < batchCount) {
+      while (nextBatch < batchCount && !queryFailed) {
         const offset = nextBatch++ * batchSize;
         const input = texts.slice(offset, offset + batchSize);
         const data = await withRetry(async () => {
@@ -2350,14 +2393,15 @@ export class OpenAiLLM implements LLM {
               // Jina's retrieval embedders are trained per task; the text itself stays raw.
               ...(isJinaEndpoint(this.baseUrl) ? { task: options.isQuery ? "retrieval.query" : "retrieval.passage" } : {}),
               ...pin,
-            });
+            }, options.isQuery ? resolveEmbedTimeoutMs() : OPENAI_REQUEST_TIMEOUT_MS);
           } catch (error) {
             // 0 = no answer (network error, timeout); a 200 whose body is not JSON did answer.
             const status = error instanceof HttpStatusError ? error.status : error instanceof SyntaxError ? "invalid-json" : 0;
             console.error(`embed: request failed status=${status} provider=${"provider" in pin ? provider : "unpinned"}`);
+            if (options.isQuery) queryFailed = true;
             throw error;
           }
-        }, { onRetry: status => options.onThrottle?.(status) });
+        }, { onRetry: status => options.onThrottle?.(status), ...(options.isQuery ? { retries: 0 } : {}) });
         if (data.provider && !options.isQuery && data.provider !== this.lastServedBy) {
           this.lastServedBy = data.provider;
           console.error(`embed: served by provider=${data.provider}`);
@@ -2367,7 +2411,15 @@ export class OpenAiLLM implements LLM {
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(concurrency, batchCount) }, worker));
+    try {
+      await Promise.all(Array.from({ length: Math.min(concurrency, batchCount) }, worker));
+    } catch (error) {
+      // A 429, a timeout, a 5xx or a network error means the embedder cannot serve queries now: skip it.
+      // Any other 4xx (bad input, a wrong key) answers for this request alone and still throws.
+      if (!options.isQuery || !failureTripsEmbedBreaker(error)) throw error;
+      tripEmbedBreaker(breakerKey);
+      console.error(`QMD: embed failed (${rerankFailureLabel(error)}); the meaning-based part of the search is skipped`);
+    }
     return results;
   }
 
