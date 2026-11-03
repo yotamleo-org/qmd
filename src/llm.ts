@@ -2351,6 +2351,12 @@ export class OpenAiLLM implements LLM {
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     const [result] = await this.embedBatch([text], options);
+    // embedBatch answers a skipped query embed with null so a hybrid search can fall back to its keyword part.
+    // A caller of embed() has no keyword part to fall back to (searchVec, `qmd vsearch`, bench): as before the
+    // breaker, it gets an error, never an empty success.
+    if (!result && options.isQuery) {
+      throw new Error("the remote embedding service did not answer in time or is down; the meaning-based search cannot run (it is skipped for a while after a failure, see QMD_EMBED_BREAKER_MS)");
+    }
     return result ?? null;
   }
 
