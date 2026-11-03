@@ -2373,8 +2373,10 @@ export class OpenAiLLM implements LLM {
     // DeepInfra and Nebius), so a stalled pin is retried, never swapped. What an
     // operator needs to see is which provider answered and which attempts failed.
     let nextBatch = 0;
+    // One failed query batch ends the call, so the workers still running claim no further batch (and send no further request).
+    let queryFailed = false;
     const worker = async () => {
-      while (nextBatch < batchCount) {
+      while (nextBatch < batchCount && !queryFailed) {
         const offset = nextBatch++ * batchSize;
         const input = texts.slice(offset, offset + batchSize);
         const data = await withRetry(async () => {
@@ -2390,6 +2392,7 @@ export class OpenAiLLM implements LLM {
             // 0 = no answer (network error, timeout); a 200 whose body is not JSON did answer.
             const status = error instanceof HttpStatusError ? error.status : error instanceof SyntaxError ? "invalid-json" : 0;
             console.error(`embed: request failed status=${status} provider=${"provider" in pin ? provider : "unpinned"}`);
+            if (options.isQuery) queryFailed = true;
             throw error;
           }
         }, { onRetry: status => options.onThrottle?.(status), ...(options.isQuery ? { retries: 0 } : {}) });

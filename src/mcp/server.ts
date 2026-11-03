@@ -184,7 +184,7 @@ function formatSearchSummary(results: SearchResultItem[], query: string, rerankS
   if (results.length === 0) {
     // An empty answer must not read as "nothing matches" when the meaning-based part never ran.
     return embedSkipped
-      ? `No keyword results found for "${query}". Note: the embedding service did not answer in time or is down; the meaning-based part of the search was skipped, so this is not a confirmed miss.`
+      ? `No results returned for "${query}". Note: the embedding service did not answer in time or is down; the meaning-based part of the search was skipped, so this is not a confirmed miss.`
       : `No results found for "${query}"`;
   }
   const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];

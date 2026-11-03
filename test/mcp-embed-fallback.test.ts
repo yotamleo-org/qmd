@@ -52,7 +52,7 @@ const hydeSearch = { searches: [{ type: "lex", query: "alpha" }, { type: "hyde",
 describe("query tool: a hung remote embed never holds a search", () => {
   let dir: string;
   let stub: Server;
-  let mode: "ok" | "hang" | "429";
+  let mode: "ok" | "hang" | "429" | "first-429";
   let embedCalls: number;
   let modelCount = 0;
   let handle: HttpServerHandle;
@@ -91,10 +91,11 @@ describe("query tool: a hung remote embed never holds a search", () => {
       req.on("data", c => { body += c; });
       req.on("end", () => {
         if (mode === "hang") return; // accepts the request, never answers
-        if (mode === "429") { res.writeHead(429, { "content-type": "application/json" }).end('{"error":"slow down"}'); return; }
+        if (mode === "429" || (mode === "first-429" && embedCalls === 1)) { res.writeHead(429, { "content-type": "application/json" }).end('{"error":"slow down"}'); return; }
         const n = (JSON.parse(body).input as unknown[]).length;
         const data = Array.from({ length: n }, (_, index) => ({ index, embedding: [0.1, 0.2, 0.3, 0.4] }));
-        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ data }));
+        // first-429: the other worker answers a moment later, after the call has already failed.
+        setTimeout(() => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ data })), mode === "first-429" ? 150 : 0);
       });
     });
     await new Promise<void>(r => stub.listen(0, "127.0.0.1", r));
@@ -170,6 +171,7 @@ describe("query tool: a hung remote embed never holds a search", () => {
       expect(res.result?.structuredContent.embedSkipped).toBe(true);
       expect(res.result?.content[0].text).toMatch(NOTE);
       expect(res.result?.content[0].text).toMatch(/not a confirmed miss/);
+      expect(res.result?.content[0].text).toMatch(/^No results returned/); // no keyword search ran, so it never says one did
       const second = await rpc(handle.port, args); // breaker open: the same answer, no request
       expect(embedCalls).toBe(1);
       expect(second.result?.structuredContent.embedSkipped).toBe(true);
@@ -207,6 +209,20 @@ describe("query tool: a hung remote embed never holds a search", () => {
     expect(embedCalls).toBe(1); // no retry
     await rpc(handle.port, vecSearch);
     expect(embedCalls).toBe(1); // breaker open
+  }, 20_000);
+
+  test("once one query batch has failed, the workers still running send no further request", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    process.env.QMD_OPENAI_EMBED_BATCH_SIZE = "1";
+    process.env.QMD_OPENAI_EMBED_CONCURRENCY = "2";
+    await start();
+    mode = "first-429";
+    const searches = [{ type: "lex", query: "alpha" }, ...["one", "two", "three", "four"].map(w => ({ type: "vec", query: `alpha ${w}` }))];
+    const res = await rpc(handle.port, { searches, rerank: false });
+    expect(res.result?.isError).toBeUndefined();
+    expect(res.result?.content[0].text).toMatch(NOTE);
+    await new Promise(r => setTimeout(r, 400)); // let the slow worker finish its batch and look for another
+    expect(embedCalls).toBe(2); // the two first batches; the surviving worker claimed no third one
   }, 20_000);
 
   test("REST /query carries embedSkipped outside the rows, also when no row comes back", async () => {
