@@ -272,6 +272,8 @@ export interface SearchOptions {
   explain?: boolean;
   /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
   chunkStrategy?: ChunkStrategy;
+  /** Called when the meaning-based part was skipped (the embedder hung, failed or its breaker is open), even when no result comes back. */
+  onEmbedSkipped?: () => void;
 }
 
 /**
@@ -807,6 +809,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           candidateLimit: opts.candidateLimit,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
+          hooks: opts.onEmbedSkipped ? { onEmbedSkipped: opts.onEmbedSkipped } : undefined,
         });
       }
 
@@ -822,6 +825,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         candidateLimit: opts.candidateLimit,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
+        hooks: opts.onEmbedSkipped ? { onEmbedSkipped: opts.onEmbedSkipped } : undefined,
       });
     }),
     searchLex: (q, opts) => admit("searchLex", async () => {

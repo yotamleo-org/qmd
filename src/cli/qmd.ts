@@ -2766,6 +2766,7 @@ type OutputRow = {
   explain?: HybridQueryExplain;
   rerankTimedOut?: true;
   rerankSkipped?: true;
+  embedSkipped?: true;
 };
 
 const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
@@ -2895,6 +2896,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         ...(opts.explain && row.explain && { explain: row.explain }),
         ...(row.rerankTimedOut && { rerankTimedOut: true }),
         ...(row.rerankSkipped && { rerankSkipped: true }),
+        ...(row.embedSkipped && { embedSkipped: true }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -3374,6 +3376,9 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
           onEmbedDone: (ms) => {
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
+          onEmbedSkipped: () => {
+            process.stderr.write("QMD: the embedding service did not answer; the meaning-based part of the search was skipped, so an empty or thin answer is not a confirmed miss.\n");
+          },
           onRerankStart: (chunkCount) => {
             process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
             progress.indeterminate();
@@ -3413,6 +3418,9 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
           },
           onEmbedDone: (ms) => {
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
+          },
+          onEmbedSkipped: () => {
+            process.stderr.write("QMD: the embedding service did not answer; the meaning-based part of the search was skipped, so an empty or thin answer is not a confirmed miss.\n");
           },
           onRerankStart: (chunkCount) => {
             process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
@@ -3454,6 +3462,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       explain: r.explain,
       rerankTimedOut: r.rerankTimedOut,
       rerankSkipped: r.rerankSkipped,
+      embedSkipped: r.embedSkipped,
     })), displayQuery, { ...opts, limit: results.length });
     await exitIfRerankHung();
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
