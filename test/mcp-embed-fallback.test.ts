@@ -67,7 +67,7 @@ describe("query tool: a hung remote embed never holds a search", () => {
     writeFileSync(join(docs, "b.md"), "# Beta\n\nalpha delta echo\n");
     const model = `openai:stub-embed-${++modelCount}`;
     writeFileSync(join(dir, "index.yml"),
-      `collections:\n  notes:\n    path: ${docs}\n    pattern: "**/*.md"\nmodels:\n  embed: ${model}\n  openai_base_url: ${base}\n`);
+      `collections:\n  notes:\n    path: ${docs}\n    pattern: "**/*.md"\nmodels:\n  embed: ${model}\n  generate: openai:stub-gen\n  openai_base_url: ${base}\n`);
     process.env.INDEX_PATH = join(dir, "index.sqlite");
     process.env.QMD_CONFIG_DIR = dir;
     process.env.QMD_OPENAI_API_KEY = "stub-key";
