@@ -6336,6 +6336,8 @@ export interface SearchHooks {
   onEmbedStart?: (count: number) => void;
   /** Embedding complete */
   onEmbedDone?: (elapsedMs: number) => void;
+  /** A query embed was skipped or failed (hung, down, breaker open): the meaning-based part did not run. Fires even when no row comes back. */
+  onEmbedSkipped?: () => void;
   /** Reranking is about to start */
   onRerankStart?: (chunkCount: number) => void;
   /** Reranking finished */
@@ -6522,7 +6524,7 @@ export async function hybridQuery(
     const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
-    if (embeddings.some(e => !e)) embedSkipped = true;
+    if (embeddings.some(e => !e)) { embedSkipped = true; hooks?.onEmbedSkipped?.(); }
 
     // Run sqlite-vec lookups with pre-computed embeddings
     for (let i = 0; i < vecQueries.length; i++) {
@@ -6556,7 +6558,8 @@ export async function hybridQuery(
   if (expanded.length > 0) {
     const runnable = expanded.filter(q => q.type === "lex" || hasVectors);
     const expansionContributed = rankedListMeta.some(m => m.queryType !== "original");
-    if (runnable.length > 0 && !expansionContributed) {
+    // An embed outage empties the vec/hyde lists for a good expansion too: only judge it when the embed ran.
+    if (runnable.length > 0 && !expansionContributed && !embedSkipped) {
       store.invalidateExpansionCache(query);
     }
   }
@@ -6946,7 +6949,7 @@ export async function structuredSearch(
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
-      if (embeddings.some(e => !e)) embedSkipped = true;
+      if (embeddings.some(e => !e)) { embedSkipped = true; hooks?.onEmbedSkipped?.(); }
 
       for (let i = 0; i < vecSearches.length; i++) {
         const embedding = embeddings[i]?.embedding;

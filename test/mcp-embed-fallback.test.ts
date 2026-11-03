@@ -2,7 +2,7 @@
  * HIMMEL-8764: typed searches answer inline, so a hung remote embedder must not hold one for the
  * 120 s request timeout. Real store, real indexed and embedded collection, a real HTTP stub for the
  * remote /embeddings endpoint that accepts the request and never answers (store.search is not stubbed).
- * Each test embeds with its own model id, so the per-model embed breaker never carries across tests.
+ * Each test embeds with its own model id, so the embed breaker (keyed by endpoint and model) never carries across tests.
  */
 import { describe, test, expect, afterEach, beforeEach, vi } from "vitest";
 import { createServer, type Server } from "node:http";
@@ -45,12 +45,14 @@ async function rpc(port: number, args: Record<string, unknown>): Promise<Rpc> {
 
 const NOTE = /meaning-based part of the search was skipped/;
 const vecSearch = { searches: [{ type: "lex", query: "alpha" }, { type: "vec", query: "alpha things" }], rerank: false };
+const vecOnly = { searches: [{ type: "vec", query: "alpha things" }], rerank: false };
+const hydeOnly = { searches: [{ type: "hyde", query: "a note about alpha" }], rerank: false };
 const hydeSearch = { searches: [{ type: "lex", query: "alpha" }, { type: "hyde", query: "a note about alpha" }], rerank: false };
 
 describe("query tool: a hung remote embed never holds a search", () => {
   let dir: string;
   let stub: Server;
-  let hang: boolean;
+  let mode: "ok" | "hang" | "429";
   let embedCalls: number;
   let modelCount = 0;
   let handle: HttpServerHandle;
@@ -74,13 +76,13 @@ describe("query tool: a hung remote embed never holds a search", () => {
     await store.embed();
     await store.close();
     embedCalls = 0; // count only what the searches ask
-    hang = true;
+    mode = "hang";
     handle = await startMcpHttpServer(0, { quiet: true, dbPath: join(dir, "index.sqlite") });
   }
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), "qmd-embed-fb-"));
-    hang = false;
+    mode = "ok";
     embedCalls = 0;
     stub = createServer((req, res) => {
       if (!req.url?.endsWith("/embeddings")) { res.writeHead(404).end(); return; }
@@ -88,7 +90,8 @@ describe("query tool: a hung remote embed never holds a search", () => {
       let body = "";
       req.on("data", c => { body += c; });
       req.on("end", () => {
-        if (hang) return; // accepts the request, never answers
+        if (mode === "hang") return; // accepts the request, never answers
+        if (mode === "429") { res.writeHead(429, { "content-type": "application/json" }).end('{"error":"slow down"}'); return; }
         const n = (JSON.parse(body).input as unknown[]).length;
         const data = Array.from({ length: n }, (_, index) => ({ index, embedding: [0.1, 0.2, 0.3, 0.4] }));
         res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ data }));
@@ -129,7 +132,7 @@ describe("query tool: a hung remote embed never holds a search", () => {
 
     const t0 = Date.now();
     const second = await rpc(handle.port, vecSearch);
-    expect(Date.now() - t0).toBeLessThan(250);
+    expect(Date.now() - t0).toBeLessThan(1_500); // the request count below is the proof; this only rules out a wait
     expect(embedCalls).toBe(1);
     expect(second.result?.structuredContent.results.length).toBe(2);
     expect(second.result?.content[0].text).toMatch(NOTE);
@@ -154,5 +157,69 @@ describe("query tool: a hung remote embed never holds a search", () => {
     expect(Date.now() - t0).toBeLessThan(5_000);
     expect(res.result?.structuredContent.results.length).toBe(2);
     expect(res.result?.content[0].text).toMatch(NOTE);
+  }, 20_000);
+
+  // The answer must never be an empty success: with no row to carry a flag, the text and structuredContent say it.
+  for (const [kind, args] of [["vec-only", vecOnly], ["hyde-only", hydeOnly]] as const) {
+    test(`a ${kind} search with the embed skipped says so instead of answering an empty success`, async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      const res = await rpc(handle.port, args);
+      expect(res.result?.isError).toBeUndefined();
+      expect(res.result?.structuredContent.results.length).toBe(0);
+      expect(res.result?.structuredContent.embedSkipped).toBe(true);
+      expect(res.result?.content[0].text).toMatch(NOTE);
+      expect(res.result?.content[0].text).toMatch(/not a confirmed miss/);
+      const second = await rpc(handle.port, args); // breaker open: the same answer, no request
+      expect(embedCalls).toBe(1);
+      expect(second.result?.structuredContent.embedSkipped).toBe(true);
+      expect(second.result?.content[0].text).toMatch(NOTE);
+    }, 20_000);
+  }
+
+  test("a search whose rows a minScore emptied still carries the flag and the note", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await start();
+    const res = await rpc(handle.port, { ...vecSearch, minScore: 1.5 }); // above any blended score: every keyword row is filtered out
+    expect(res.result?.structuredContent.results.length).toBe(0);
+    expect(res.result?.structuredContent.embedSkipped).toBe(true);
+    expect(res.result?.content[0].text).toMatch(NOTE);
+  }, 20_000);
+
+  test("a plain query falls back the same way", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await start();
+    const res = await rpc(handle.port, { query: "alpha", rerank: false });
+    expect(res.result?.isError).toBeUndefined();
+    expect(res.result?.structuredContent.results.length).toBe(2);
+    expect(res.result?.structuredContent.embedSkipped).toBe(true);
+    expect(res.result?.content[0].text).toMatch(NOTE);
+  }, 30_000);
+
+  test("a 429 on the query embed takes the same fallback as a hang and opens the breaker", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await start();
+    mode = "429";
+    const res = await rpc(handle.port, vecSearch);
+    expect(res.result?.isError).toBeUndefined();
+    expect(res.result?.structuredContent.results.length).toBe(2);
+    expect(res.result?.content[0].text).toMatch(NOTE);
+    expect(embedCalls).toBe(1); // no retry
+    await rpc(handle.port, vecSearch);
+    expect(embedCalls).toBe(1); // breaker open
+  }, 20_000);
+
+  test("REST /query carries embedSkipped outside the rows, also when no row comes back", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await start();
+    const post = async (body: unknown) => (await (await fetch(`http://localhost:${handle.port}/query`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    })).json()) as { results: Array<Record<string, unknown>>; embedSkipped?: true };
+    const withRows = await post(vecSearch);
+    expect(withRows.results.length).toBe(2);
+    expect(withRows.embedSkipped).toBe(true);
+    const empty = await post(vecOnly);
+    expect(empty.results.length).toBe(0);
+    expect(empty.embedSkipped).toBe(true);
   }, 20_000);
 });

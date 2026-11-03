@@ -404,6 +404,11 @@ export function tripEmbedBreaker(model: string): void {
   const ttl = Number.isFinite(raw) && raw >= 0 ? Math.min(raw, MAX_TIMER_MS) : DEFAULT_EMBED_BREAKER_MS;
   embedBreakerUntil.set(model, Date.now() + ttl);
 }
+/** A query embed that hit a 429, a 5xx, a timeout or the network is skipped; any other 4xx is the caller's. */
+export function failureTripsEmbedBreaker(err: unknown): boolean {
+  if (err instanceof HttpStatusError) return err.status === 429 || err.status >= 500;
+  return true;
+}
 export function isEmbedBreakerOpen(model: string | undefined): boolean {
   return model !== undefined && Date.now() < (embedBreakerUntil.get(model) ?? 0);
 }
@@ -2400,10 +2405,11 @@ export class OpenAiLLM implements LLM {
     try {
       await Promise.all(Array.from({ length: Math.min(concurrency, batchCount) }, worker));
     } catch (error) {
-      // A 4xx answers for this request only (bad input, one 429) and still throws; a timeout, 5xx or network error means the embedder is down.
-      if (!options.isQuery || !failureTripsRerankBreaker(error)) throw error;
+      // A 429, a timeout, a 5xx or a network error means the embedder cannot serve queries now: skip it.
+      // Any other 4xx (bad input, a wrong key) answers for this request alone and still throws.
+      if (!options.isQuery || !failureTripsEmbedBreaker(error)) throw error;
       tripEmbedBreaker(breakerKey);
-      console.error(`QMD: embed failed (${rerankFailureLabel(error)}); serving keyword results`);
+      console.error(`QMD: embed failed (${rerankFailureLabel(error)}); the meaning-based part of the search is skipped`);
     }
     return results;
   }

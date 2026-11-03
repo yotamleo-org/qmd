@@ -178,9 +178,14 @@ function encodeQmdPath(path: string): string {
 /**
  * Format search results as human-readable text summary
  */
+const EMBED_SKIPPED_NOTE = 'Note: the embedding service did not answer in time or is down; the meaning-based part of the search was skipped (or only partly done), so these results lean on keyword matches.';
+
 function formatSearchSummary(results: SearchResultItem[], query: string, rerankSkipped = false, embedSkipped = false): string {
   if (results.length === 0) {
-    return `No results found for "${query}"`;
+    // An empty answer must not read as "nothing matches" when the meaning-based part never ran.
+    return embedSkipped
+      ? `No keyword results found for "${query}". Note: the embedding service did not answer in time or is down; the meaning-based part of the search was skipped, so this is not a confirmed miss.`
+      : `No results found for "${query}"`;
   }
   const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];
   for (const r of results) {
@@ -192,7 +197,7 @@ function formatSearchSummary(results: SearchResultItem[], query: string, rerankS
     lines.push('\nNote: the reranker is off (QMD_RERANK=off, an earlier rerank hang, or a recent remote rerank failure); results are unreranked (RRF order).');
   }
   if (embedSkipped) {
-    lines.push('\nNote: the embedding service did not answer in time or is down; the meaning-based part of the search was skipped (or only partly done), so these results lean on keyword matches.');
+    lines.push(`\n${EMBED_SKIPPED_NOTE}`);
   }
   return lines.join('\n');
 }
@@ -670,9 +675,12 @@ Intent-aware lex (C++ performance, not sports):
       }
 
       let results;
+      // Set by the search itself when the meaning-based part was skipped; it holds even when no row comes back.
+      let embedSkipped = false;
       try {
         results = await store.search({
           ...searchOptions,
+          onEmbedSkipped: () => { embedSkipped = true; },
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           filter: filterValidation.filter,
           limit,
@@ -712,8 +720,6 @@ Intent-aware lex (C++ performance, not sports):
 
       // The search itself says when it skipped the reranker the caller wanted (off, hung, breaker open).
       const rerankSkipped = results.some(r => r.rerankSkipped);
-      // Likewise when the query embed was skipped (hung, down or breaker open): the answer is the keyword part.
-      const embedSkipped = results.some(r => r.embedSkipped);
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery, rerankSkipped, embedSkipped) }],
@@ -1488,8 +1494,10 @@ export async function startMcpHttpServer(
         // Use default collections if none specified
         const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
 
+        let embedSkipped = false;
         const results = await store.search({
           queries,
+          onEmbedSkipped: () => { embedSkipped = true; },
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           filter: restFilter,
           limit: typeof params.limit === "number" ? params.limit : 10,
@@ -1522,7 +1530,7 @@ export async function startMcpHttpServer(
         });
 
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
-        nodeRes.end(JSON.stringify({ results: formatted }));
+        nodeRes.end(JSON.stringify({ results: formatted, ...(embedSkipped ? { embedSkipped: true as const } : {}) }));
         exitIfRerankHung(store);
         log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
         return;
