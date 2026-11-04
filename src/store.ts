@@ -5453,7 +5453,8 @@ function cacheRerankScoresBestEffort(db: Database, entries: [string, string][]):
       for (const [cacheKey, score] of entries) setCachedResult(db, cacheKey, score);
       db.exec(`COMMIT`);
     } catch (err) {
-      db.exec(`ROLLBACK`);
+      // SQLite may already have rolled back (SQLITE_FULL, SQLITE_IOERR); never let the rollback hide err.
+      if (db.inTransaction) try { db.exec(`ROLLBACK`); } catch { /* err below is the one that matters */ }
       throw err;
     }
   } catch (err) {
