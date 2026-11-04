@@ -5417,6 +5417,52 @@ export function resolveRerankMaxDocChars(): number {
   return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_RERANK_MAX_DOC_CHARS;
 }
 
+const DEFAULT_RERANK_CACHE_BUSY_TIMEOUT_MS = 250;
+
+/**
+ * How long the post-rerank cache write may wait for another process's write lock. Override with
+ * QMD_RERANK_CACHE_BUSY_TIMEOUT_MS (milliseconds; 0 = never wait).
+ */
+export function resolveRerankCacheBusyTimeoutMs(): number {
+  const raw = process.env.QMD_RERANK_CACHE_BUSY_TIMEOUT_MS;
+  const parsed = raw !== undefined && raw !== "" ? Number(raw) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : DEFAULT_RERANK_CACHE_BUSY_TIMEOUT_MS;
+}
+
+function isSqliteBusy(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null;
+  return (typeof e?.code === "string" && e.code.startsWith("SQLITE_BUSY")) ||
+    (typeof e?.message === "string" && /database is locked/i.test(e.message));
+}
+
+/**
+ * Cache rerank scores in one transaction that waits at most resolveRerankCacheBusyTimeoutMs for the
+ * write lock, then gives up (HIMMEL-8848). SQLite calls are synchronous: a write waiting out the
+ * connection's busy_timeout (120 s) blocks the daemon's one thread and every search queued behind it
+ * while qmd update or qmd embed holds the lock. The scores are only a cache, so a busy database skips
+ * them; the next search reranks again. The connection's busy_timeout is restored before returning, so
+ * other writers keep the long wait.
+ */
+function cacheRerankScoresBestEffort(db: Database, entries: [string, string][]): void {
+  if (entries.length === 0) return;
+  const previous = (db.prepare(`PRAGMA busy_timeout`).get() as { timeout: number }).timeout;
+  db.exec(`PRAGMA busy_timeout = ${resolveRerankCacheBusyTimeoutMs()}`);
+  try {
+    db.exec(`BEGIN IMMEDIATE`);
+    try {
+      for (const [cacheKey, score] of entries) setCachedResult(db, cacheKey, score);
+      db.exec(`COMMIT`);
+    } catch (err) {
+      db.exec(`ROLLBACK`);
+      throw err;
+    }
+  } catch (err) {
+    if (!isSqliteBusy(err)) throw err;
+  } finally {
+    db.exec(`PRAGMA busy_timeout = ${previous}`);
+  }
+}
+
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
@@ -5505,12 +5551,13 @@ export async function rerank(query: string, documents: { file: string; text: str
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
+    const toCache: [string, string][] = [];
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk, maxChars });
-      setCachedResult(db, cacheKey, result.score.toString());
+      toCache.push([getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk, maxChars }), result.score.toString()]);
       cachedResults.set(chunk, result.score);
     }
+    cacheRerankScoresBestEffort(db, toCache);
   }
 
   // Return all results sorted by score
