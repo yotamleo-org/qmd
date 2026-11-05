@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isBun } from "../src/db.ts";
+import type { LLM } from "../src/llm.ts";
 import { createStore, getCacheKey, getCachedResult, setCachedResult, type Store } from "../src/store.ts";
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -57,7 +58,7 @@ describe("expansion cache writes: a write lock held by another process never hol
         expandCalls++;
         return [{ type: "lex", text: "freeze daemon" }, { type: "vec", text: "daemon stops answering searches" }];
       },
-    } as unknown as NonNullable<Store["llm"]>;
+    } satisfies Partial<LLM> as LLM;
     process.env.QMD_RERANK_CACHE_BUSY_TIMEOUT_MS = "100";
   });
   afterEach(async () => {
