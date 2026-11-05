@@ -5389,7 +5389,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     .map(r => ({ type: r.type, query: r.text })));
 
   if (expanded.length > 0) {
-    setCachedResult(db, cacheKey, JSON.stringify(expanded));
+    cacheWriteBestEffort(db, () => setCachedResult(db, cacheKey, JSON.stringify(expanded)));
   }
 
   return expanded;
@@ -5402,7 +5402,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
  */
 export function deleteExpansionCacheEntry(db: Database, query: string, model: string = DEFAULT_QUERY_MODEL): void {
   const cacheKey = getCacheKey("expandQuery", { query, model });
-  db.prepare(`DELETE FROM llm_cache WHERE hash = ?`).run(cacheKey);
+  cacheWriteBestEffort(db, () => { db.prepare(`DELETE FROM llm_cache WHERE hash = ?`).run(cacheKey); });
 }
 
 // =============================================================================
@@ -5436,21 +5436,20 @@ function isSqliteBusy(err: unknown): boolean {
 }
 
 /**
- * Cache rerank scores in one transaction that waits at most resolveRerankCacheBusyTimeoutMs for the
- * write lock, then gives up (HIMMEL-8848). SQLite calls are synchronous: a write waiting out the
- * connection's busy_timeout (120 s) blocks the daemon's one thread and every search queued behind it
- * while qmd update or qmd embed holds the lock. The scores are only a cache, so a busy database skips
- * them; the next search reranks again. The connection's busy_timeout is restored before returning, so
- * other writers keep the long wait.
+ * Run llm_cache writes in one transaction that waits at most resolveRerankCacheBusyTimeoutMs for the
+ * write lock, then gives up (HIMMEL-8848, HIMMEL-9068). SQLite calls are synchronous: a write waiting
+ * out the connection's busy_timeout (120 s) blocks the daemon's one thread and every search queued
+ * behind it while qmd update or qmd embed holds the lock. The rows are only a cache, so a busy
+ * database skips them; the next search recomputes. The connection's busy_timeout is restored before
+ * returning, so other writers keep the long wait. The env override name keeps its rerank spelling.
  */
-function cacheRerankScoresBestEffort(db: Database, entries: [string, string][]): void {
-  if (entries.length === 0) return;
+function cacheWriteBestEffort(db: Database, write: () => void): void {
   const previous = (db.prepare(`PRAGMA busy_timeout`).get() as { timeout: number }).timeout;
   db.exec(`PRAGMA busy_timeout = ${resolveRerankCacheBusyTimeoutMs()}`);
   try {
     db.exec(`BEGIN IMMEDIATE`);
     try {
-      for (const [cacheKey, score] of entries) setCachedResult(db, cacheKey, score);
+      write();
       db.exec(`COMMIT`);
     } catch (err) {
       // SQLite may already have rolled back (SQLITE_FULL, SQLITE_IOERR); never let the rollback hide err.
@@ -5462,6 +5461,13 @@ function cacheRerankScoresBestEffort(db: Database, entries: [string, string][]):
   } finally {
     db.exec(`PRAGMA busy_timeout = ${previous}`);
   }
+}
+
+function cacheRerankScoresBestEffort(db: Database, entries: [string, string][]): void {
+  if (entries.length === 0) return;
+  cacheWriteBestEffort(db, () => {
+    for (const [cacheKey, score] of entries) setCachedResult(db, cacheKey, score);
+  });
 }
 
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {

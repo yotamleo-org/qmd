@@ -37,6 +37,10 @@ Carried on top of tobi/qmd main (HIMMEL-5952 resync):
   picomatch) are bounded at 200 entries, 256 characters per entry and 16 KiB
   instead, and a docid over 256 characters is refused; the CLI is unchanged
   (HIMMEL-7227).
+- Cache writes after a rerank and for a query expansion (the save and the
+  delete of a dud entry) wait at most 250 ms for the database while another
+  process holds the write lock, then skip; `QMD_RERANK_CACHE_BUSY_TIMEOUT_MS`
+  (milliseconds, `0` = never wait) sets the wait for both (HIMMEL-8848, 9068).
 
 ### Fixed
 
