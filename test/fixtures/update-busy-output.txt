@@ -1,17 +1,17 @@
 Updating 1 collection(s)...
 
 [1/1] a (**/*.md)
-Collection: /tmp/claude-1000/-home-overlord-Documents-github-himmel--claude-worktrees-chore-himmel-9517-qmd-fork-scoped-update/b1e2002e-6cb7-4652-bac2-7f0068608f4c/scratchpad/busy-work/a (**/*.md)
-/tmp/claude-1000/-home-overlord-Documents-github-himmel--claude-worktrees-chore-himmel-9517-qmd-fork-scoped-update/b1e2002e-6cb7-4652-bac2-7f0068608f4c/scratchpad/qmd-fork-9517-21a/src/store.ts:3615
+Collection: /tmp/qmd-update-busy/a (**/*.md)
+/qmd-fork/src/store.ts:3615
     .run(hash, content, createdAt);
      ^
 
 SqliteError: database is locked
-    at insertContent (/tmp/claude-1000/-home-overlord-Documents-github-himmel--claude-worktrees-chore-himmel-9517-qmd-fork-scoped-update/b1e2002e-6cb7-4652-bac2-7f0068608f4c/scratchpad/qmd-fork-9517-21a/src/store.ts:3615:6)
-    at reindexCollectionIn (/tmp/claude-1000/-home-overlord-Documents-github-himmel--claude-worktrees-chore-himmel-9517-qmd-fork-scoped-update/b1e2002e-6cb7-4652-bac2-7f0068608f4c/scratchpad/qmd-fork-9517-21a/src/store.ts:2061:9)
-    at async reindexCollection (/tmp/claude-1000/-home-overlord-Documents-github-himmel--claude-worktrees-chore-himmel-9517-qmd-fork-scoped-update/b1e2002e-6cb7-4652-bac2-7f0068608f4c/scratchpad/qmd-fork-9517-21a/src/store.ts:1877:20)
-    at async updateCollections (/tmp/claude-1000/-home-overlord-Documents-github-himmel--claude-worktrees-chore-himmel-9517-qmd-fork-scoped-update/b1e2002e-6cb7-4652-bac2-7f0068608f4c/scratchpad/qmd-fork-9517-21a/src/cli/qmd.ts:1032:20)
-    at async <anonymous> (/tmp/claude-1000/-home-overlord-Documents-github-himmel--claude-worktrees-chore-himmel-9517-qmd-fork-scoped-update/b1e2002e-6cb7-4652-bac2-7f0068608f4c/scratchpad/qmd-fork-9517-21a/src/cli/qmd.ts:5046:7) {
+    at insertContent (/qmd-fork/src/store.ts:3615:6)
+    at reindexCollectionIn (/qmd-fork/src/store.ts:2061:9)
+    at async reindexCollection (/qmd-fork/src/store.ts:1877:20)
+    at async updateCollections (/qmd-fork/src/cli/qmd.ts:1032:20)
+    at async <anonymous> (/qmd-fork/src/cli/qmd.ts:5046:7) {
   code: 'SQLITE_BUSY'
 }
 

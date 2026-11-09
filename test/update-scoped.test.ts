@@ -21,7 +21,7 @@ let configDir: string;
 let dirA: string;
 let dirB: string;
 
-async function runQmd(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+async function runQmd(args: string[], env: Record<string, string> = {}): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const argv = isBunRuntime ? [qmdScript, ...args] : [tsxCli, qmdScript, ...args];
   const proc = spawn(process.execPath, argv, {
     cwd: root,
@@ -31,6 +31,7 @@ async function runQmd(args: string[]): Promise<{ stdout: string; stderr: string;
       QMD_CONFIG_DIR: configDir,
       PWD: root,
       QMD_DOCTOR_DEVICE_PROBE: "0",
+      ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -143,5 +144,46 @@ describe("qmd update, scoped and cache-keeping (HIMMEL-9517)", () => {
 
     expect(exitCode).toBe(1);
     expect(stderr).toContain("Collection not found: nope");
+  });
+
+  test("missing_collection_fails: a name in the YAML but not the database, with the write lock held, exits 1", async () => {
+    // The config sync that would add `c` to the database cannot take the write lock, and
+    // getStore() swallows that failure, so only the guard in updateCollections stops the run.
+    const dirC = join(root, "c");
+    mkdirSync(dirC);
+    writeFileSync(join(dirC, "note.md"), "# C\n");
+    writeFileSync(join(configDir, "index.yml"), [
+      "collections:",
+      ...[["a", dirA], ["b", dirB], ["c", dirC]].flatMap(([name, dir]) => [
+        `  ${name}:`, `    path: ${dir}`, `    pattern: "**/*.md"`,
+      ]),
+      "",
+    ].join("\n"));
+    expect(query<{ name: string }>(`SELECT name FROM store_collections WHERE name = 'c'`)).toEqual([]);
+
+    const script = join(root, "hold.mts"); // .mts: the temp dir has no package.json saying ESM
+    writeFileSync(script, [
+      `import { openDatabase } from ${JSON.stringify(join(projectRoot, "src", "db.ts"))};`,
+      `const db = openDatabase(${JSON.stringify(dbPath)});`,
+      `db.exec("BEGIN IMMEDIATE");`,
+      `process.stdout.write("held\\n");`,
+      `setTimeout(() => { db.exec("ROLLBACK"); db.close(); process.exit(0); }, 20000);`,
+    ].join("\n"));
+    const holder = spawn(process.execPath, isBunRuntime ? [script] : [tsxCli, script], { stdio: ["ignore", "pipe", "inherit"] });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        holder.stdout.on("data", (d: Buffer) => { if (d.toString().includes("held")) resolve(); });
+        holder.once("exit", code => reject(new Error(`lock holder exited early (${code})`)));
+      });
+
+      const { stderr, exitCode } = await runQmd(["update", "-c", "c"], { QMD_SQLITE_BUSY_TIMEOUT: "500" });
+
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain("Collection not available in database: c");
+    } finally {
+      const gone = new Promise(resolve => holder.once("exit", resolve));
+      holder.kill();
+      await gone;
+    }
   });
 });
