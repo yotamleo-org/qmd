@@ -41,6 +41,9 @@ Carried on top of tobi/qmd main (HIMMEL-5952 resync):
   delete of a dud entry) wait at most 250 ms for the database while another
   process holds the write lock, then skip; `QMD_RERANK_CACHE_BUSY_TIMEOUT_MS`
   (milliseconds, `0` = never wait) sets the wait for both (HIMMEL-8848, 9068).
+- `qmd update -c <collection>` indexes one collection (an unknown name errors as
+  `embed -c` does), and `qmd update` no longer clears the LLM cache; only
+  `qmd cleanup` does. The SDK's `update` still clears it (HIMMEL-9517).
 
 ### Fixed
 

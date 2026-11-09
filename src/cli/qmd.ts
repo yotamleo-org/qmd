@@ -953,7 +953,7 @@ function manageTrust(subcommand?: string): void {
   console.log(`${c.dim}Editing a hook, out-of-project path, or custom model will ask again. Revoke with 'qmd trust revoke'.${c.reset}`);
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(only: string[] = []): Promise<void> {
   // Prompt before opening the store so an approval is visible to getStore (#889).
   const allowed = await resolveLocalConfigTrust();
 
@@ -961,10 +961,16 @@ async function updateCollections(): Promise<void> {
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
-  // Clear Ollama cache on update
-  clearCache(db);
-
-  const collections = listCollections(db);
+  // The LLM cache is kept: only `qmd cleanup` clears it (HIMMEL-9517).
+  const collections = listCollections(db).filter(col => only.length === 0 || only.includes(col.name));
+  // getStore() swallows a failed config sync (a held write lock), so a name that passed the
+  // YAML check can still be absent from the database: fail rather than exit 0 unindexed.
+  const missing = only.find(name => !collections.some(col => col.name === name));
+  if (missing !== undefined) {
+    console.error(`Collection not available in database: ${missing}`);
+    closeDb();
+    process.exit(1);
+  }
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -3958,7 +3964,7 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
-  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd update [--pull] [-c <name>] - Re-index collections, or one with -c (optionally git pull first)");
   console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's hooks/paths/models");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
@@ -5044,7 +5050,8 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections();
+      // An unknown -c name errors as `embed -c` does; no -c keeps every collection.
+      await updateCollections(resolveCollectionFilter(cli.opts.collection, false));
       break;
 
     case "trust":
