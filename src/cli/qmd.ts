@@ -963,6 +963,14 @@ async function updateCollections(only: string[] = []): Promise<void> {
 
   // The LLM cache is kept: only `qmd cleanup` clears it (HIMMEL-9517).
   const collections = listCollections(db).filter(col => only.length === 0 || only.includes(col.name));
+  // getStore() swallows a failed config sync (a held write lock), so a name that passed the
+  // YAML check can still be absent from the database: fail rather than exit 0 unindexed.
+  const missing = only.find(name => !collections.some(col => col.name === name));
+  if (missing !== undefined) {
+    console.error(`Collection not available in database: ${missing}`);
+    closeDb();
+    process.exit(1);
+  }
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
