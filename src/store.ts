@@ -3734,6 +3734,23 @@ export function countOrphanedContent(db: Database): number {
   return row.c;
 }
 
+/**
+ * The unary plus keeps SQLite from probing documents through
+ * idx_documents_collection, which scans a whole collection per vector row (a
+ * 10+ minute query on a 300k-row index); the hash index is a point lookup.
+ */
+const ORPHANED_PARTITION_ROW_FILTER_SQL = `
+  NOT EXISTS (
+    SELECT 1 FROM documents d WHERE d.hash = vr.hash AND +d.collection = ci.name AND +d.active = 1
+  )
+`;
+
+export const ORPHANED_VECTOR_ROWS_SQL = `
+  SELECT vr.id FROM ${VEC_ROWS_TABLE} vr
+  JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
+  WHERE ${ORPHANED_PARTITION_ROW_FILTER_SQL}
+`;
+
 const ORPHANED_VECTOR_COUNT_SQL = `
   SELECT COUNT(*) as c FROM content_vectors cv
   WHERE NOT EXISTS (
@@ -3783,15 +3800,19 @@ export function cleanupOrphanedVectors(db: Database): number {
     // BEGIN IMMEDIATE: upgrading a deferred read snapshot under a concurrent
     // WAL writer fails with SQLITE_BUSY_SNAPSHOT instead of honoring the busy
     // timeout. Nested callers still get a savepoint.
+    const scanOrphans = () => ({
+      orphanRows: db.prepare(ORPHANED_VECTOR_ROWS_SQL).all() as { id: number }[],
+      orphanedChunks: (db.prepare(ORPHANED_VECTOR_COUNT_SQL).get() as { c: number }).c,
+    });
+    // Scan once without the write lock: the usual run has nothing to remove and
+    // must not make every other writer wait for a scan. A caller already in a
+    // transaction holds its own lock, so the scan is skipped there.
+    if (!db.inTransaction) {
+      const first = scanOrphans();
+      if (first.orphanRows.length === 0 && first.orphanedChunks === 0) return 0;
+    }
     const cleanup = db.transaction(() => {
-      const orphanRows = db.prepare(`
-        SELECT vr.id FROM ${VEC_ROWS_TABLE} vr
-        JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
-        WHERE NOT EXISTS (
-          SELECT 1 FROM documents d WHERE d.hash = vr.hash AND d.collection = ci.name AND d.active = 1
-        )
-      `).all() as { id: number }[];
-      const orphanedChunks = (db.prepare(ORPHANED_VECTOR_COUNT_SQL).get() as { c: number }).c;
+      const { orphanRows, orphanedChunks } = scanOrphans();
       if (orphanRows.length === 0 && orphanedChunks === 0) {
         return 0;
       }
@@ -3868,7 +3889,7 @@ function vectorRepackPlan(db: Database, dropOrphans: boolean = false): VecRepack
       FROM ${VEC_ROWS_TABLE} vr
       JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
       JOIN ${layout.shadow.rowids} r ON r.rowid = vr.id
-      WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = vr.hash AND d.collection = ci.name AND d.active = 1)
+      WHERE ${ORPHANED_PARTITION_ROW_FILTER_SQL}
       GROUP BY r.chunk_id
     `).all() as { chunkId: number; n: number }[];
     for (const row of rows) orphansByChunk.set(row.chunkId, row.n);

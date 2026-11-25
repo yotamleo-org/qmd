@@ -18,6 +18,10 @@ Carried on top of tobi/qmd v2.9.0 (HIMMEL-10446 resync; earlier HIMMEL-5952):
   5882).
 - `qmd update` counts pending hashes for the configured embed model
   (HIMMEL-5887).
+- `qmd update` no longer holds the write lock through its orphaned-vector scan:
+  the scan looks documents up by hash (it scanned a whole collection per vector
+  row, 10+ minutes on a 7 GB index) and runs once before the lock, so a run with
+  nothing to remove takes no write lock (HIMMEL-11112).
 - Plain-text `query` bursts are admission-gated, and typed vec searches are
   capped and serialized (HIMMEL-5891).
 - MCP `query` returns a task (`resultType: "task"`) when the request declares
