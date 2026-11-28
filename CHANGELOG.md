@@ -22,6 +22,10 @@ Carried on top of tobi/qmd v2.9.0 (HIMMEL-10446 resync; earlier HIMMEL-5952):
   the scan looks documents up by hash (it scanned a whole collection per vector
   row, 10+ minutes on a 7 GB index) and runs once before the lock, so a run with
   nothing to remove takes no write lock (HIMMEL-11112).
+- Opening an existing index and syncing an unchanged config take no write lock:
+  both ran a `BEGIN IMMEDIATE` on every open, so a `qmd query` behind a long
+  `update` or `embed` died with `SQLITE_BUSY` and printed the processor schema
+  DDL (HIMMEL-11508).
 - Plain-text `query` bursts are admission-gated, and typed vec searches are
   capped and serialized (HIMMEL-5891).
 - MCP `query` returns a task (`resultType: "task"`) when the request declares
