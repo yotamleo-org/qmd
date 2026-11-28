@@ -14,7 +14,20 @@ import {
   type DocumentProcessor, type ProcessorDocument,
 } from "./processors.js";
 
+const PROCESSOR_SCHEMA_OBJECTS = [
+  "processor_specs", "processor_modes", "processor_sources", "processor_outputs", "idx_processor_outputs_source",
+];
+
+/**
+ * Every store open runs this, a read-only `qmd query` included. When the schema
+ * is already there it returns before BEGIN IMMEDIATE, so an open never waits
+ * for the write lock another writer holds.
+ */
 export function initializeProcessorSchema(db: Database): void {
+  const present = db.prepare(
+    `SELECT count(*) AS n FROM sqlite_master WHERE name IN (${PROCESSOR_SCHEMA_OBJECTS.map(() => "?").join(", ")})`,
+  ).get(...PROCESSOR_SCHEMA_OBJECTS) as { n: number };
+  if (present.n === PROCESSOR_SCHEMA_OBJECTS.length) return;
   db.transaction(() => db.exec(`
     CREATE TABLE IF NOT EXISTS processor_specs (collection TEXT PRIMARY KEY, spec TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS processor_modes (collection TEXT PRIMARY KEY);

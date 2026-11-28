@@ -1684,12 +1684,13 @@ export function syncConfigToDb(db: Database, config: CollectionConfig): void {
   const configJson = JSON.stringify(config);
   const hash = createHash('sha256').update(configJson).digest('hex');
 
-  const apply = (): void => {
-    // Check config hash — skip sync if unchanged
+  const unchanged = (): boolean => {
     const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
-    if (existingHash != null && existingHash.value === hash) {
-      return; // Config unchanged, skip sync
-    }
+    return existingHash != null && existingHash.value === hash;
+  };
+
+  const apply = (): void => {
+    if (unchanged()) return;
 
     // Sync collections
     const configNames = new Set(Object.keys(config.collections));
@@ -1719,7 +1720,8 @@ export function syncConfigToDb(db: Database, config: CollectionConfig): void {
 
   // Already inside a caller's transaction: join it instead of opening one.
   if (db.inTransaction) apply();
-  else db.transaction(apply).immediate();
+  // An unchanged config takes no write lock; apply re-checks under the lock.
+  else if (!unchanged()) db.transaction(apply).immediate();
 }
 
 
